@@ -1,5 +1,5 @@
 # app.py
-# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v16
+# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v17
 # 실행:
 #   pip install streamlit pandas plotly
 #   py -m streamlit run app.py
@@ -2449,6 +2449,28 @@ for type_name in type_order:
 weapon_options = [f'{w["type"]} | {w["weapon"]}' for w in filtered_weapons]
 weapon_option_map = {f'{w["type"]} | {w["weapon"]}': w for w in filtered_weapons}
 
+# 검색창은 타입 필터와 무관하게 전체 무기를 대상으로 한다.
+all_weapons_sorted = []
+for type_name in type_order:
+    weapons_in_type = [w for w in WEAPON_DATA if w["type"] == type_name]
+    weapons_in_type = sorted(weapons_in_type, key=lambda w: w["weapon"], reverse=True)
+    all_weapons_sorted.extend(weapons_in_type)
+
+all_weapon_options = [f'{w["type"]} | {w["weapon"]}' for w in all_weapons_sorted]
+all_weapon_option_map = {f'{w["type"]} | {w["weapon"]}': w for w in all_weapons_sorted}
+
+
+def unique_labels_preserve_order(labels: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for label in labels:
+        if label in seen:
+            continue
+        seen.add(label)
+        result.append(label)
+    return result
+
+
 st.sidebar.subheader("계산 옵션")
 armor_plates = st.sidebar.radio(
     "방탄 플레이트",
@@ -2537,19 +2559,38 @@ selected_weapon_options = st.sidebar.multiselect(
     "비교할 총기",
     weapon_options,
     default=[],
-    placeholder="비교할 총기를 직접 선택하세요",
+    placeholder="타입 필터에서 고를 총기를 선택하세요",
 )
 
-if not selected_weapon_options:
-    st.info("왼쪽 사이드바에서 비교할 총기를 직접 선택하세요.")
+searched_weapon_options = st.sidebar.multiselect(
+    "총기명 검색 추가",
+    all_weapon_options,
+    default=[],
+    placeholder="총기 이름을 입력하세요",
+    help="키보드로 총기명을 입력하면 자동완성 목록에서 바로 추가할 수 있습니다. 타입 필터와 무관하게 전체 무기에서 검색합니다.",
+)
+
+selected_weapon_labels = unique_labels_preserve_order(
+    selected_weapon_options + searched_weapon_options
+)
+
+if not selected_weapon_labels:
+    st.info("왼쪽 사이드바에서 비교할 총기를 직접 선택하거나, 총기명 검색으로 추가하세요.")
     st.stop()
 
-selected_weapon_data = [weapon_option_map[label] for label in selected_weapon_options if label in weapon_option_map]
-weapon_by_name = {weapon["weapon"]: weapon for weapon in filtered_weapons}
+selected_weapon_data = [
+    all_weapon_option_map[label]
+    for label in selected_weapon_labels
+    if label in all_weapon_option_map
+]
+weapon_by_name = {weapon["weapon"]: weapon for weapon in WEAPON_DATA}
 
 if not selected_weapon_data:
-    st.warning("선택된 타입 안에 비교할 총기가 없습니다.")
+    st.warning("비교할 총기가 선택되지 않았습니다.")
     st.stop()
+
+if searched_weapon_options:
+    st.sidebar.caption("검색으로 추가한 총기는 무기 타입 필터와 관계없이 비교 대상에 포함됩니다.")
 
 summary_rows = [
     weapon_result_row(weapon=w, distance=float(distance), armor_plates=armor_plates)
