@@ -1,5 +1,5 @@
 # app.py
-# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v24
+# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v25
 # 실행:
 #   pip install streamlit pandas plotly
 #   py -m streamlit run app.py
@@ -2923,7 +2923,7 @@ with duel_cols[1]:
 with duel_cols[2]:
     st.slider(
         "교전 거리",
-        min_value=0,
+        min_value=15,
         max_value=100,
         step=1,
         key="duel_distance_slider",
@@ -2932,14 +2932,17 @@ with duel_cols[2]:
 with duel_cols[3]:
     st.number_input(
         "거리 +/-",
-        min_value=0,
+        min_value=15,
         max_value=100,
         step=1,
         key="duel_distance_number",
         on_change=sync_duel_distance_from_number,
     )
 
-duel_distance = int(st.session_state.duel_distance_value)
+duel_distance = max(15, int(st.session_state.duel_distance_value))
+st.session_state.duel_distance_value = duel_distance
+st.session_state.duel_distance_slider = duel_distance
+st.session_state.duel_distance_number = duel_distance
 
 if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
     if duel_a_label == duel_b_label:
