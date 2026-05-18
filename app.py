@@ -1,5 +1,5 @@
 # app.py
-# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v25
+# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v26
 # 실행:
 #   pip install streamlit pandas plotly
 #   py -m streamlit run app.py
@@ -2889,10 +2889,28 @@ duel_weapon_options = [
 
 if "duel_distance_value" not in st.session_state:
     st.session_state.duel_distance_value = 15
+
+# 기존 세션 또는 이전 버전에서 15m 미만 값이 남아 있어도,
+# 위젯을 만들기 전에 먼저 보정해야 Streamlit 세션 오류가 나지 않는다.
+st.session_state.duel_distance_value = max(15, int(st.session_state.duel_distance_value))
+
 if "duel_distance_slider" not in st.session_state:
     st.session_state.duel_distance_slider = st.session_state.duel_distance_value
+else:
+    st.session_state.duel_distance_slider = max(15, int(st.session_state.duel_distance_slider))
+
 if "duel_distance_number" not in st.session_state:
     st.session_state.duel_distance_number = st.session_state.duel_distance_value
+else:
+    st.session_state.duel_distance_number = max(15, int(st.session_state.duel_distance_number))
+
+# 세 값이 서로 어긋나 있으면 위젯 생성 전에 같은 값으로 맞춘다.
+st.session_state.duel_distance_value = max(
+    15,
+    int(st.session_state.duel_distance_value),
+)
+st.session_state.duel_distance_slider = st.session_state.duel_distance_value
+st.session_state.duel_distance_number = st.session_state.duel_distance_value
 
 
 def sync_duel_distance_from_slider():
@@ -2939,10 +2957,7 @@ with duel_cols[3]:
         on_change=sync_duel_distance_from_number,
     )
 
-duel_distance = max(15, int(st.session_state.duel_distance_value))
-st.session_state.duel_distance_value = duel_distance
-st.session_state.duel_distance_slider = duel_distance
-st.session_state.duel_distance_number = duel_distance
+duel_distance = int(st.session_state.duel_distance_value)
 
 if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
     if duel_a_label == duel_b_label:
