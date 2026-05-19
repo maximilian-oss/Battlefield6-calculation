@@ -1,5 +1,5 @@
 # app.py
-# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v27
+# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v28
 # 실행:
 #   pip install streamlit pandas plotly
 #   py -m streamlit run app.py
@@ -3140,10 +3140,12 @@ if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
 
             win_fig.add_vline(
                 x=duel_distance,
-                line_width=1,
+                line_width=2,
                 line_dash="dot",
+                line_color="white",
                 annotation_text=f"현재 {duel_distance}m",
                 annotation_position="top",
+                annotation_font_color="white",
             )
 
             win_fig.update_layout(
