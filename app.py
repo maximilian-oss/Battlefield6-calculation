@@ -1,5 +1,5 @@
 # app.py
-# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v26
+# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v27
 # 실행:
 #   pip install streamlit pandas plotly
 #   py -m streamlit run app.py
@@ -2706,6 +2706,48 @@ def duel_win_probability(df_a: pd.DataFrame, df_b: pd.DataFrame) -> tuple[float,
     return float(a_score), float(b_score), float(tie)
 
 
+def duel_distance_sweep_win_probability(
+    weapon_a: Dict,
+    weapon_b: Dict,
+    armor_plates: int,
+    min_distance: int = 15,
+    max_distance: int = 100,
+    step: int = 1,
+) -> pd.DataFrame:
+    """
+    15m부터 최대 거리까지 모든 거리에서 A/B 승률을 계산한다.
+    슬라이더 값과 무관하게 같은 두 총기/방탄판 조건에서는 동일한 곡선이 나오고,
+    화면에서는 현재 선택 거리만 수직선으로 표시한다.
+    """
+    rows = []
+
+    for distance_value in range(int(min_distance), int(max_distance) + 1, int(step)):
+        df_a = duel_variable_accuracy_distribution(
+            weapon_a,
+            distance=float(distance_value),
+            armor_plates=int(armor_plates),
+        )
+        df_b = duel_variable_accuracy_distribution(
+            weapon_b,
+            distance=float(distance_value),
+            armor_plates=int(armor_plates),
+        )
+
+        a_win, b_win, tie_probability = duel_win_probability(df_a, df_b)
+
+        rows.append({
+            "distance": distance_value,
+            "a_weapon": weapon_a.get("weapon", ""),
+            "b_weapon": weapon_b.get("weapon", ""),
+            "a_win_percent": a_win * 100.0,
+            "b_win_percent": b_win * 100.0,
+            "tie_percent": tie_probability * 100.0,
+            "winner": weapon_a.get("weapon", "") if a_win >= b_win else weapon_b.get("weapon", ""),
+        })
+
+    return pd.DataFrame(rows)
+
+
 # =========================
 # Streamlit UI
 # =========================
@@ -3048,23 +3090,72 @@ if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
 
         st.dataframe(result_df, use_container_width=True, hide_index=True)
 
-        duel_plot_df = pd.concat([duel_df_a, duel_df_b], ignore_index=True)
-        if not duel_plot_df.empty:
-            duel_plot_df["probability_percent"] = duel_plot_df["probability"] * 100.0
-            duel_fig = px.line(
-                duel_plot_df,
-                x="kill_time_sec",
-                y="cumulative_percent",
-                color="weapon",
-                title=f"{duel_distance}m 누적 처치 확률",
-                labels={
-                    "kill_time_sec": "처치 시간 sec",
-                    "cumulative_percent": "누적 처치 확률 %",
-                    "weapon": "총기",
-                },
+        duel_sweep_df = duel_distance_sweep_win_probability(
+            duel_weapon_a,
+            duel_weapon_b,
+            armor_plates=int(armor_plates),
+            min_distance=15,
+            max_distance=100,
+            step=1,
+        )
+
+        if not duel_sweep_df.empty:
+            win_fig = go.Figure()
+
+            win_fig.add_trace(
+                go.Scatter(
+                    x=duel_sweep_df["distance"],
+                    y=duel_sweep_df["a_win_percent"],
+                    mode="lines",
+                    name=f"{duel_weapon_a['weapon']} 승률",
+                    line=dict(width=3),
+                    hovertemplate=
+                    "거리: %{x}m<br>"
+                    f"{duel_weapon_a['weapon']} 승률: " + "%{y:.1f}%"
+                    "<extra></extra>",
+                )
             )
-            duel_fig.update_layout(yaxis=dict(range=[0, 100]))
-            st.plotly_chart(duel_fig, use_container_width=True)
+
+            win_fig.add_trace(
+                go.Scatter(
+                    x=duel_sweep_df["distance"],
+                    y=duel_sweep_df["b_win_percent"],
+                    mode="lines",
+                    name=f"{duel_weapon_b['weapon']} 승률",
+                    line=dict(width=3),
+                    hovertemplate=
+                    "거리: %{x}m<br>"
+                    f"{duel_weapon_b['weapon']} 승률: " + "%{y:.1f}%"
+                    "<extra></extra>",
+                )
+            )
+
+            win_fig.add_hline(
+                y=50,
+                line_width=1,
+                line_dash="dash",
+                annotation_text="50%",
+                annotation_position="top left",
+            )
+
+            win_fig.add_vline(
+                x=duel_distance,
+                line_width=1,
+                line_dash="dot",
+                annotation_text=f"현재 {duel_distance}m",
+                annotation_position="top",
+            )
+
+            win_fig.update_layout(
+                title="거리별 승률 그래프",
+                xaxis_title="거리 m",
+                yaxis_title="승률 %",
+                yaxis=dict(range=[0, 100]),
+                xaxis=dict(range=[15, 100]),
+                legend_title="총기",
+            )
+
+            st.plotly_chart(win_fig, use_container_width=True)
 
         with st.expander("1:1 비교 모델 설명"):
             st.write(
@@ -3074,6 +3165,7 @@ if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
                 - `G(n,d)`는 표적 너비/높이가 거리에서 차지하는 허용각과, n번째 탄의 반동 오차를 비교한 기하학 값입니다.
                 - 15~40m는 10발 단위, 40m 초과는 8발 단위로 반동 패턴이 리셋된다고 가정합니다.
                 - 승률은 두 총기의 킬 시간 분포를 직접 비교해 계산합니다. 같은 시간에 처치하는 경우는 0.5승으로 처리합니다.
+                - 거리별 승률 그래프는 15~100m 전체를 고정 계산하며, 슬라이더는 현재 확인 중인 거리의 수직선만 움직입니다.
                 """
             )
 else:
