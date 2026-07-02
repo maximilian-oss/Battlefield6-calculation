@@ -7,7 +7,7 @@
 # - Selectable armor: 0, 1, or 2 plates (40 HP each)
 # - Armor damage curve uses +10 m extended drop-off ranges
 # - Update 1.3.3.0 automatic-weapon body/chest damage vs armor: 0.84x
-# - Selectable vertical recoil control for all weapons: 0%, 50%, 70%, or 80%
+# - Separate recoil controls: vertical 0/50/70/80%, horizontal 0/20/30%
 # - Search and select only the weapons to calculate; autocomplete shows weapon names only
 # - Monte Carlo trials: exactly 262,144 per selected weapon and selected distance
 # - Practical STK includes every missed round fired before the kill
@@ -41,11 +41,13 @@ except ImportError:  # allows command-line self-test without Streamlit installed
 # Fixed model settings
 # ============================================================
 
-BUILD_ID = "BF6-MC-262144-SEARCH-CLASSCOLOR-R8"
+BUILD_ID = "BF6-MC-262144-SEPARATE-VH-CONTROL-R9"
 MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 armor"
 TRIALS_PER_WEAPON = 262_144
 VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80)
+HORIZONTAL_RECOIL_CONTROL_OPTIONS = (0, 20, 30)
 DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT = 0
+DEFAULT_HORIZONTAL_RECOIL_CONTROL_PERCENT = 0
 BASE_RANDOM_SEED = 20_260_702
 MAX_SHOTS = 240
 TARGET_HEALTH = 100.0
@@ -327,6 +329,7 @@ def simulate_weapon(
     distance_m: int,
     trials: int = TRIALS_PER_WEAPON,
     vertical_recoil_control_percent: int = DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT,
+    horizontal_recoil_control_percent: int = DEFAULT_HORIZONTAL_RECOIL_CONTROL_PERCENT,
     armor_plates: int = 0,
 ) -> dict[str, Any]:
     weapon = WEAPON_BY_ID[weapon_id]
@@ -342,6 +345,16 @@ def simulate_weapon(
         )
     vertical_recoil_remaining = np.float32(
         1.0 - vertical_recoil_control_percent / 100.0
+    )
+
+    horizontal_recoil_control_percent = int(horizontal_recoil_control_percent)
+    if horizontal_recoil_control_percent not in HORIZONTAL_RECOIL_CONTROL_OPTIONS:
+        raise ValueError(
+            "horizontal_recoil_control_percent must be one of "
+            f"{HORIZONTAL_RECOIL_CONTROL_OPTIONS}"
+        )
+    horizontal_recoil_remaining = np.float32(
+        1.0 - horizontal_recoil_control_percent / 100.0
     )
 
     armor_plates = int(armor_plates)
@@ -478,7 +491,9 @@ def simulate_weapon(
         ).astype(np.float32)
         direction_rad = np.deg2rad(recoil_direction_deg)
         recoil_x[alive] += (
-            -recoil_amount * np.sin(direction_rad[alive])
+            -recoil_amount
+            * np.sin(direction_rad[alive])
+            * horizontal_recoil_remaining
         )
         recoil_y[alive] += (
             recoil_amount
@@ -601,6 +616,7 @@ def simulate_weapon(
             "distance_m": int(distance_m),
             "trials": trials,
             "vertical_recoil_control_percent": vertical_recoil_control_percent,
+            "horizontal_recoil_control_percent": horizontal_recoil_control_percent,
             "armor_plates": armor_plates,
             "initial_armor_hp": float(initial_armor_hp),
             "health_body_damage": float(health_body_damage),
@@ -631,6 +647,7 @@ def simulate_weapon(
         "distance_m": int(distance_m),
         "trials": trials,
         "vertical_recoil_control_percent": vertical_recoil_control_percent,
+        "horizontal_recoil_control_percent": horizontal_recoil_control_percent,
         "armor_plates": armor_plates,
         "initial_armor_hp": float(initial_armor_hp),
         "health_body_damage": float(health_body_damage),
@@ -654,6 +671,7 @@ def simulate_all_weapons(
     distance_m: int,
     trials: int = TRIALS_PER_WEAPON,
     vertical_recoil_control_percent: int = DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT,
+    horizontal_recoil_control_percent: int = DEFAULT_HORIZONTAL_RECOIL_CONTROL_PERCENT,
     armor_plates: int = 0,
 ) -> pd.DataFrame:
     rows = [
@@ -662,6 +680,7 @@ def simulate_all_weapons(
             int(distance_m),
             int(trials),
             int(vertical_recoil_control_percent),
+            int(horizontal_recoil_control_percent),
             int(armor_plates),
         )
         for weapon in WEAPON_DATA
@@ -700,6 +719,7 @@ def _format_results(results: pd.DataFrame) -> pd.DataFrame:
             "weapon": "총기",
             "rpm": "RPM",
             "vertical_recoil_control_percent": "수직 반동 제어 (%)",
+            "horizontal_recoil_control_percent": "수평 반동 제어 (%)",
             "armor_plates": "방탄판 (장)",
             "initial_armor_hp": "초기 방탄 HP",
             "health_body_damage": "일반 몸통 데미지",
@@ -770,14 +790,10 @@ def render_app() -> None:
         options=weapon_names,
         default=[],
         placeholder="총기 이름을 입력하세요 (예: M433)",
-        help=(
-            "검색과 자동완성 목록에는 Assault/M433 같은 형식이 아니라 "
-            "M433처럼 총기 이름만 표시됩니다. 여러 총기를 동시에 선택할 수 있습니다."
-        ),
     )
 
-    control_col, armor_col, distance_col = st.columns([1.25, 1.0, 2.0])
-    with control_col:
+    vertical_col, horizontal_col, armor_col, distance_col = st.columns([1.25, 1.15, 1.0, 2.0])
+    with vertical_col:
         vertical_recoil_control_percent = st.radio(
             "수직 반동 제어",
             options=list(VERTICAL_RECOIL_CONTROL_OPTIONS),
@@ -787,6 +803,18 @@ def render_app() -> None:
             help=(
                 "각 발의 수직 반동 성분만 선택한 비율만큼 상쇄합니다. "
                 "수평 반동과 스프레드는 바뀌지 않습니다."
+            ),
+        )
+    with horizontal_col:
+        horizontal_recoil_control_percent = st.radio(
+            "수평 반동 제어",
+            options=list(HORIZONTAL_RECOIL_CONTROL_OPTIONS),
+            index=0,
+            horizontal=True,
+            format_func=lambda value: f"{value}%",
+            help=(
+                "각 발의 좌우 반동 성분만 선택한 비율만큼 상쇄합니다. "
+                "수직 반동과 스프레드는 바뀌지 않습니다."
             ),
         )
     with armor_col:
@@ -823,7 +851,8 @@ def render_app() -> None:
 
     calculate = st.button(
         f"선택한 {len(selected_weapons)}종 × {TRIALS_PER_WEAPON:,}회 계산 · "
-        f"수직 제어 {vertical_recoil_control_percent}% · 방탄판 {armor_plates}장",
+        f"수직 {vertical_recoil_control_percent}% · 수평 {horizontal_recoil_control_percent}% · "
+        f"방탄판 {armor_plates}장",
         type="primary",
         use_container_width=True,
     )
@@ -832,12 +861,13 @@ def render_app() -> None:
         selected_ids,
         int(distance_m),
         int(vertical_recoil_control_percent),
+        int(horizontal_recoil_control_percent),
         int(armor_plates),
     )
     if calculate:
-        st.session_state["bf6_requested_key_r8"] = request_key
+        st.session_state["bf6_requested_key_r9"] = request_key
 
-    if st.session_state.get("bf6_requested_key_r8") != request_key:
+    if st.session_state.get("bf6_requested_key_r9") != request_key:
         st.warning("총기와 조건을 정한 뒤 계산 버튼을 누르세요.")
         return
 
@@ -858,6 +888,9 @@ def render_app() -> None:
                 trials=TRIALS_PER_WEAPON,
                 vertical_recoil_control_percent=int(
                     vertical_recoil_control_percent
+                ),
+                horizontal_recoil_control_percent=int(
+                    horizontal_recoil_control_percent
                 ),
                 armor_plates=int(armor_plates),
             )
@@ -884,6 +917,7 @@ def render_app() -> None:
         "총기",
         "RPM",
         "수직 반동 제어 (%)",
+        "수평 반동 제어 (%)",
         "방탄판 (장)",
         "초기 방탄 HP",
         "일반 몸통 데미지",
@@ -923,7 +957,8 @@ def render_app() -> None:
         data=csv_bytes,
         file_name=(
             f"bf6_mc_{selected_slug}_{int(distance_m)}m_vcontrol-"
-            f"{int(vertical_recoil_control_percent)}pct_"
+            f"{int(vertical_recoil_control_percent)}pct_hcontrol-"
+            f"{int(horizontal_recoil_control_percent)}pct_"
             f"armor-{int(armor_plates)}_"
             f"{TRIALS_PER_WEAPON}.csv"
         ),
@@ -936,6 +971,7 @@ def render_app() -> None:
                 "선택 총기": selected_weapon_names,
                 "시행 횟수": f"선택한 총기마다 정확히 {TRIALS_PER_WEAPON:,}회",
                 "수직 반동 제어": f"{vertical_recoil_control_percent}%",
+                "수평 반동 제어": f"{horizontal_recoil_control_percent}%",
                 "방탄판": f"{armor_plates}장 / {armor_plates * ARMOR_HP_PER_PLATE:.0f} HP",
                 "방탄 데미지 구간": (
                     f"방탄이 남아 있는 동안 모든 구간 경계를 +{ARMOR_DAMAGE_RANGE_EXTENSION_M:.0f}m 연장; "
@@ -944,8 +980,8 @@ def render_app() -> None:
                 "방탄 몸통 배율": f"자동화기 {AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER:.2f}x",
                 "방탄 초과 피해": "남은 방탄 HP를 넘는 같은 탄환의 피해는 체력으로 이월",
                 "제어 적용 방식": (
-                    "매 발 새로 발생한 수직 반동 성분에만 적용; "
-                    "수평 반동·스프레드는 미변경"
+                    "매 발 새로 발생한 반동을 수직·수평 성분으로 분해해 각각의 "
+                    "선택 비율만큼 상쇄; 스프레드는 미변경"
                 ),
                 "조준점": f"가슴 중앙 y={AIM_POINT_Y_M}m",
                 "반동 방향": "평균 방향 ± Sym per-side variation",
@@ -986,11 +1022,13 @@ def self_test() -> None:
             "m433",
             distance_m=20,
             trials=2_048,
-            vertical_recoil_control_percent=control,
+            vertical_recoil_control_percent=vertical_control,
+            horizontal_recoil_control_percent=horizontal_control,
             armor_plates=armor_plates,
         )
         for armor_plates in ARMOR_PLATE_OPTIONS
-        for control in VERTICAL_RECOIL_CONTROL_OPTIONS
+        for vertical_control in VERTICAL_RECOIL_CONTROL_OPTIONS
+        for horizontal_control in HORIZONTAL_RECOIL_CONTROL_OPTIONS
     ]
     result = results[0]
     required = {
@@ -999,24 +1037,29 @@ def self_test() -> None:
         "accuracy",
         "kill_probability",
         "pause_count_mean",
+        "vertical_recoil_control_percent",
+        "horizontal_recoil_control_percent",
     }
     missing = required - set(result)
     if missing:
         raise RuntimeError(f"self-test missing keys: {sorted(missing)}")
     if not (0.0 <= float(result["kill_probability"]) <= 1.0):
         raise RuntimeError("invalid kill probability")
+
+    result_index = 0
     for armor_plates in ARMOR_PLATE_OPTIONS:
-        for control in VERTICAL_RECOIL_CONTROL_OPTIONS:
-            index = armor_plates * len(VERTICAL_RECOIL_CONTROL_OPTIONS) + list(
-                VERTICAL_RECOIL_CONTROL_OPTIONS
-            ).index(control)
-            control_result = results[index]
-            if int(control_result["vertical_recoil_control_percent"]) != control:
-                raise RuntimeError("vertical recoil control was not preserved")
-            if int(control_result["armor_plates"]) != armor_plates:
-                raise RuntimeError("armor plate count was not preserved")
-            if not (0.0 <= float(control_result["kill_probability"]) <= 1.0):
-                raise RuntimeError("invalid kill probability")
+        for vertical_control in VERTICAL_RECOIL_CONTROL_OPTIONS:
+            for horizontal_control in HORIZONTAL_RECOIL_CONTROL_OPTIONS:
+                control_result = results[result_index]
+                result_index += 1
+                if int(control_result["vertical_recoil_control_percent"]) != vertical_control:
+                    raise RuntimeError("vertical recoil control was not preserved")
+                if int(control_result["horizontal_recoil_control_percent"]) != horizontal_control:
+                    raise RuntimeError("horizontal recoil control was not preserved")
+                if int(control_result["armor_plates"]) != armor_plates:
+                    raise RuntimeError("armor plate count was not preserved")
+                if not (0.0 <= float(control_result["kill_probability"]) <= 1.0):
+                    raise RuntimeError("invalid kill probability")
 
     m433 = WEAPON_BY_ID["m433"]
     if damage_at_distance(m433["damage_profile"], 30) != 20.0:
