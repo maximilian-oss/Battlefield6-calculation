@@ -1,4073 +1,718 @@
 # app.py
-# Battlefield 6 TTK 계산기 - Update 1.3.3.0 반영 v29
-# 실행:
-#   pip install streamlit pandas plotly
-#   py -m streamlit run app.py
+# Battlefield 6 practical STK / TTK Monte Carlo calculator
+# FINAL single-file Streamlit app rebuilt from the working Monte Carlo engine.
+#
+# Fixed model:
+# - Pre-1.3.3.0 automatic-primary weapon data (37 weapons)
+# - Selectable vertical recoil control for all weapons: 0%, 50%, 70%, or 80%
+# - Monte Carlo trials: exactly 262,144 per weapon and selected distance
+# - Practical STK includes every missed round fired before the kill
+# - If the unconditional hit probability of a shot index falls to 20% or less,
+#   the next shot is delayed until 0.2 s after the previous shot
+# - No external JSON/CSV files are required
+#
+# Run:
+#   pip install streamlit numpy pandas
+#   streamlit run app.py
 
+from __future__ import annotations
+
+import json
 import math
-from typing import Dict, List
+import sys
+from dataclasses import dataclass
+from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
+
+try:
+    import streamlit as st
+except ImportError:  # allows command-line self-test without Streamlit installed
+    st = None
 
 
-# =========================
-# 기본 설정
-# =========================
+# ============================================================
+# Fixed model settings
+# ============================================================
 
-DEFAULT_HEALTH = 100
-ARMOR_HP_PER_PLATE = 40
-ARMOR_RANGE_PENALTY = 10.0
-PATCH_VERSION = "1.3.3.0 (2026-06-30)"
-
-# DMR과 Sidearm은 방탄판이 있어도 거리 +10m 데미지 모델 후퇴를 적용하지 않는다.
-# 단, 방탄판 HP 자체는 그대로 존재한다.
-ARMOR_RANGE_PENALTY_EXEMPT_TYPES = {"dmr", "sidearm"}
-
-# Update 1.3.3.0 신체 부위/방탄판 피해 배율.
-# 현재 내장 데이터에서 자동화기군은 Assault, Carbine, SMG, LMG이다.
-AUTOMATIC_PRIMARY_TYPES = {"assault", "carbine", "smg", "lmg"}
-HIT_ZONE_LABELS = {
-    "chest": "가슴",
-    "lower_body": "복부·팔다리",
-}
-
-# 배틀필드의 데미지 판정상 33.3333 * 3 = 99.9999 같은 값도 사망으로 처리되므로,
-# 프로그램에서는 모든 데미지를 소수점 셋째 자리까지 올림 처리한다.
-# 예: 33.33333333 -> 33.334
-DAMAGE_CEIL_DECIMALS = 3
-
-# 이 데이터는 업로드된 Battlefield 6 무기 데이터 엑셀의 Table 시트에서 추출한 값입니다.
-# 포함: Type, Weapon, Rate of Fire, Firing Mode, Velocity, Mag Size, Reload, 거리별 Body Damage
-# 거리 구간: 0-9.5m / 9.5-21.5m / 21.5-36.5m / 36.5-75m / 75m+
-WEAPON_DATA = [
-    {
-        "type": "Assault",
-        "weapon": "M433",
-        "rpm": 830.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 670.0,
-        "mag_size": 30.0,
-        "reload": 2.384,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "B36A4",
-        "rpm": 720.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 780.0,
-        "mag_size": 30.0,
-        "reload": 2.384,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "SOR-556 MK2",
-        "rpm": 568.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 800.0,
-        "mag_size": 30.0,
-        "reload": 2.384,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "AK4D",
-        "rpm": 514.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 720.0,
-        "mag_size": 20.0,
-        "reload": 2.467,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 20.0
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "TR-7",
-        "rpm": 720.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 648.0,
-        "mag_size": 20.0,
-        "reload": 2.4,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 20.0
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "KORD 6P67",
-        "rpm": 900.0,
-        "firing_mode": "Auto",
-        "burst_size": 2.0,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 760.0,
-        "mag_size": 30.0,
-        "reload": 2.45,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "NVO-228E",
-        "rpm": 654.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 671.0,
-        "mag_size": 30.0,
-        "reload": 2.5,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 27.25
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "L85A3",
-        "rpm": 635.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 814.0,
-        "mag_size": 30.0,
-        "reload": 2.767,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "VCR-2",
-        "rpm": 900.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 704.0,
-        "mag_size": 30.0,
-        "reload": 2.434,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Assault",
-        "weapon": "M16A4 *",
-        "rpm": 771.0,
-        "firing_mode": "Auto",
-        "burst_size": 3.0,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 720.0,
-        "mag_size": 30.0,
-        "reload": 2.2,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "M4A1",
-        "rpm": 900.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 630.0,
-        "mag_size": 30.0,
-        "reload": 2.2,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "M277",
-        "rpm": 720.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 624.0,
-        "mag_size": 20.0,
-        "reload": 2.384,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 20.0
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "AK-205",
-        "rpm": 720.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 737.0,
-        "mag_size": 30.0,
-        "reload": 2.484,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 15.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "M417 A2",
-        "rpm": 654.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 600.0,
-        "mag_size": 20.0,
-        "reload": 2.467,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 27.25
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "GRT-BC",
-        "rpm": 830.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 599.0,
-        "mag_size": 30.0,
-        "reload": 2.5,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "QBZ-192",
-        "rpm": 771.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 644.0,
-        "mag_size": 30.0,
-        "reload": 2.567,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "SG 553R",
-        "rpm": 720.0,
-        "firing_mode": "Auto",
-        "burst_size": 3.0,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 519.0,
-        "mag_size": 30.0,
-        "reload": 2.5,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "Carbine",
-        "weapon": "SOR-300SC",
-        "rpm": 600.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 563.0,
-        "mag_size": 30.0,
-        "reload": 2.25,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "SGX",
-        "rpm": 830.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 402.0,
-        "mag_size": 30.0,
-        "reload": 2.517,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "PW5A3",
-        "rpm": 771.0,
-        "firing_mode": "Auto",
-        "burst_size": 3.0,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 432.0,
-        "mag_size": 30.0,
-        "reload": 2.517,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "PW7A2",
-        "rpm": 947.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 600.0,
-        "mag_size": 30.0,
-        "reload": 2.184,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "UMG-40",
-        "rpm": 635.0,
-        "firing_mode": "Auto",
-        "burst_size": 2.0,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 488.0,
-        "mag_size": 30.0,
-        "reload": 2.517,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "USG-90",
-        "rpm": 900.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 570.0,
-        "mag_size": 50.0,
-        "reload": 3.0,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 15.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "KV9",
-        "rpm": 1080.0,
-        "firing_mode": "Auto",
-        "burst_size": 2.0,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 348.0,
-        "mag_size": 17.0,
-        "reload": 2.384,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "SCW-10",
-        "rpm": 800.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 428.0,
-        "mag_size": 15.0,
-        "reload": 2.6,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "SL9",
-        "rpm": 675.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 510.0,
-        "mag_size": 30.0,
-        "reload": 2.65,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "SMG",
-        "weapon": "CZ3A1",
-        "rpm": 981.0,
-        "firing_mode": "Auto",
-        "burst_size": 3.0,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 360.0,
-        "mag_size": 30.0,
-        "reload": 2.217,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "L110",
-        "rpm": 720.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 780.0,
-        "mag_size": 100.0,
-        "reload": 6.5,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "DRS-IAR",
-        "rpm": 771.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 720.0,
-        "mag_size": 30.0,
-        "reload": 2.467,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "M/60",
-        "rpm": 514.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 720.0,
-        "mag_size": 100.0,
-        "reload": 7.35,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 20.0
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "RPKM",
-        "rpm": 553.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 670.0,
-        "mag_size": 40.0,
-        "reload": 2.8,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 27.25
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "M123K",
-        "rpm": 830.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 670.0,
-        "mag_size": 100.0,
-        "reload": 6.65,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "M250",
-        "rpm": 675.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 760.0,
-        "mag_size": 50.0,
-        "reload": 5.75,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 25.0
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "KTS100 MK8",
-        "rpm": 514.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 840.0,
-        "mag_size": 60.0,
-        "reload": 3.25,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 20.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 16.66666667
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "M240L",
-        "rpm": 600.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 630.0,
-        "mag_size": 50.0,
-        "reload": 4.25,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 20.0
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "M121 A2",
-        "rpm": 654.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 600.0,
-        "mag_size": 50.0,
-        "reload": 6.267,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 20.0
-            }
-        ]
-    },
-    {
-        "type": "LMG",
-        "weapon": "RPK-74M *",
-        "rpm": 685.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Heavy",
-        "velocity": 840.0,
-        "mag_size": 45.0,
-        "reload": 2.784,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "DMR",
-        "weapon": "M39 EMR",
-        "rpm": 257.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Extended",
-        "velocity": 1000.0,
-        "mag_size": 20.0,
-        "reload": 2.534,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 40.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 40.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 37.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 37.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 33.33333333
-            }
-        ]
-    },
-    {
-        "type": "DMR",
-        "weapon": "LMR27",
-        "rpm": 450.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Extended",
-        "velocity": 1100.0,
-        "mag_size": 10.0,
-        "reload": 3.034,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 28.5
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 28.5
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 27.25
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 27.25
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 25.0
-            }
-        ]
-    },
-    {
-        "type": "DMR",
-        "weapon": "SVK-8.6",
-        "rpm": 150.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Extended",
-        "velocity": 900.0,
-        "mag_size": 10.0,
-        "reload": 2.967,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 66.66666667
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 60.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 50.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 50.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 50.0
-            }
-        ]
-    },
-    {
-        "type": "DMR",
-        "weapon": "SVDM",
-        "rpm": 300.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Extended",
-        "velocity": 1000.0,
-        "mag_size": 10.0,
-        "reload": 2.5,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 40.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 40.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 37.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 37.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 33.33333333
-            }
-        ]
-    },
-    {
-        "type": "DMR",
-        "weapon": "GRT-CPS",
-        "rpm": 360.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Extended",
-        "velocity": 1000.0,
-        "mag_size": 20.0,
-        "reload": 2.75,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 28.5
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 28.5
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 27.25
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 27.25
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 25.0
-            }
-        ]
-    },
-    {
-        "type": "Sidearm",
-        "weapon": "P18",
-        "rpm": 400.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 350.0,
-        "mag_size": 17.0,
-        "reload": 1.934,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "Sidearm",
-        "weapon": "ES 5.7",
-        "rpm": 450.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 650.0,
-        "mag_size": 20.0,
-        "reload": 2.017,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 15.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "Sidearm",
-        "weapon": "M45A1",
-        "rpm": 327.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 336.0,
-        "mag_size": 7.0,
-        "reload": 1.867,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 20.0
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 14.28571429
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 12.5
-            }
-        ]
-    },
-    {
-        "type": "Sidearm",
-        "weapon": "M44",
-        "rpm": 163.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 440.0,
-        "mag_size": 6.0,
-        "reload": 3.4,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 66.66666667
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 60.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 33.33333333
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 25.0
-            }
-        ]
-    },
-    {
-        "type": "Sidearm",
-        "weapon": "GGH-22",
-        "rpm": 360.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 400.0,
-        "mag_size": 15.0,
-        "reload": 1.934,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 25.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 21.4
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 17.83333333
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 14.28571429
-            }
-        ]
-    },
-    {
-        "type": "Sidearm",
-        "weapon": "M357 TRAIT",
-        "rpm": 225.0,
-        "firing_mode": "Single",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 410.0,
-        "mag_size": 8.0,
-        "reload": 3.067,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 50.0
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 37.66666667
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 27.25
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 25.0
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 20.0
-            }
-        ]
-    },
-    {
-        "type": "Sidearm",
-        "weapon": "VZ. 61",
-        "rpm": 818.0,
-        "firing_mode": "Auto",
-        "burst_size": None,
-        "burst_delay": None,
-        "barrel": "Basic",
-        "velocity": 326.0,
-        "mag_size": 10.0,
-        "reload": 2.134,
-        "damage_profile": [
-            {
-                "min_range": 0.0,
-                "max_range": 9.5,
-                "damage": 16.66666667
-            },
-            {
-                "min_range": 9.5,
-                "max_range": 21.5,
-                "damage": 15.0
-            },
-            {
-                "min_range": 21.5,
-                "max_range": 36.5,
-                "damage": 13.125
-            },
-            {
-                "min_range": 36.5,
-                "max_range": 75.0,
-                "damage": 12.5
-            },
-            {
-                "min_range": 75.0,
-                "max_range": None,
-                "damage": 11.22222222
-            }
-        ]
-    }
-]
-
-# =========================
-# Update 1.3.3.0 데이터 보정
-# =========================
-
-# 공식 패치노트의 기본 총구속도 전/후 값이다.
-# 내장 데이터가 Extended Barrel 등 부착물 수치를 담고 있는 경우에도 기존 비율을 유지하도록
-# 현재 저장값에 (패치 후 기본값 / 패치 전 기본값)을 곱한다.
-PATCH_133_VELOCITY_BASE = {
-    "ES 5.7": (650.0, 510.0),
-    "LMR27": (880.0, 800.0),
-    "SCW-10": (428.0, 398.0),
-    "SG 553R": (519.0, 483.0),
-    "TR-7": (648.0, 604.0),
-    "NVO-228E": (671.0, 626.0),
-    "M417 A2": (600.0, 560.0),
-    "M121 A2": (600.0, 560.0),
-    "CZ3A1": (360.0, 336.0),
-    "M240L": (630.0, 590.0),
-    "M4A1": (630.0, 590.0),
-    "VCR-2": (704.0, 660.0),
-    "SOR-300SC": (563.0, 528.0),
-    "GRT-BC": (599.0, 563.0),
-    "RPKM": (670.0, 630.0),
-    "M123K": (670.0, 630.0),
-    "M433": (670.0, 630.0),
-    "SGX": (402.0, 378.0),
-    "QBZ-192": (644.0, 608.0),
-    "DRS-IAR": (720.0, 680.0),
-    "M/60": (720.0, 680.0),
-    "AK4D": (720.0, 680.0),
-    "PW5A3": (432.0, 408.0),
-    "M16A4 *": (720.0, 680.0),
-    "SVK-8.6": (720.0, 680.0),
-    "L110": (780.0, 740.0),
-    "B36A4": (780.0, 740.0),
-    "M277": (624.0, 592.0),
-    "M39 EMR": (800.0, 760.0),
-    "SVDM": (800.0, 760.0),
-    "GRT-CPS": (800.0, 760.0),
-    "M250": (760.0, 724.0),
-    "KORD 6P67": (760.0, 724.0),
-    "USG-90": (570.0, 543.0),
-    "SL9": (510.0, 486.0),
-    "L85A3": (814.0, 778.0),
-    "UMG-40": (488.0, 467.0),
-    "SOR-556 MK2": (800.0, 768.0),
-    "PW7A2": (600.0, 576.0),
-    "VZ. 61": (326.0, 313.0),
-    "AK-205": (737.0, 708.0),
-    "KTS100 MK8": (840.0, 808.0),
-    "RPK-74M *": (840.0, 808.0),
-    "KV9": (348.0, 362.0),
-}
-
-for _weapon in WEAPON_DATA:
-    _velocity_change = PATCH_133_VELOCITY_BASE.get(_weapon.get("weapon"))
-    if _velocity_change and _weapon.get("velocity") is not None:
-        _old_base, _new_base = _velocity_change
-        _weapon["velocity"] = round(float(_weapon["velocity"]) * _new_base / _old_base, 3)
+BUILD_ID = "BF6-MC-262144-VERTICAL-CONTROL-FINAL-R5"
+MODEL_VERSION = "pre-1.3.3.0"
+TRIALS_PER_WEAPON = 262_144
+VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80)
+DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT = 0
+BASE_RANDOM_SEED = 20_260_702
+MAX_SHOTS = 240
+TARGET_HEALTH = 100.0
+HEAD_MULTIPLIER = 1.34
+AIM_POINT_Y_M = 1.315
+LOW_ACCURACY_THRESHOLD = 0.20
+LOW_ACCURACY_INTERVAL_S = 0.20
+SIMULATION_FRAME_S = 1.0 / 60.0
+DAMAGE_EPSILON = 1e-6
 
 
-# 원본 시트에서 RPM 또는 숫자형 거리별 데미지가 부족해서 제외된 항목입니다.
-SKIPPED_WEAPONS = [
-    "PP-19 *",
-    "M2010 ESR",
-    "SV-98",
-    "PSR",
-    "MINI SCOUT",
-    "L115 *"
-]
+# ============================================================
+# Embedded weapon data — 37 weapons, no external files
+# ============================================================
+
+WEAPON_DATA: list[dict[str, Any]] = [{'id': 'm433', 'class': 'Assault', 'weapon': 'M433', 'rpm': 830.769, 'velocity_mps': 670.0, 'mag_size': 30, 'reload_s': 2.384, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.78, 'recoil_mean_direction_deg': -22.0, 'recoil_direction_variation_per_side_deg': 50.9, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'b36a4', 'class': 'Assault', 'weapon': 'B36A4', 'rpm': 719.999, 'velocity_mps': 780.0, 'mag_size': 30, 'reload_s': 2.384, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.7, 'recoil_mean_direction_deg': -15.0, 'recoil_direction_variation_per_side_deg': 37.4, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'sor556mk2', 'class': 'Assault', 'weapon': 'SOR-556 MK2', 'rpm': 568.421, 'velocity_mps': 800.0, 'mag_size': 30, 'reload_s': 2.384, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.62, 'recoil_mean_direction_deg': -9.0, 'recoil_direction_variation_per_side_deg': 17.3, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'ak4d', 'class': 'Assault', 'weapon': 'AK4D', 'rpm': 514.285, 'velocity_mps': 720.0, 'mag_size': 20, 'reload_s': 2.467, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 33.33333333}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 25.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 25.0}, {'min_range': 75.0, 'max_range': None, 'damage': 20.0}], 'recoil_amount_deg': 0.85, 'recoil_mean_direction_deg': -18.0, 'recoil_direction_variation_per_side_deg': 25.4, 'recoil_decay_factor': 104.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.459, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.392, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'tr7', 'class': 'Assault', 'weapon': 'TR-7', 'rpm': 719.999, 'velocity_mps': 648.0, 'mag_size': 20, 'reload_s': 2.4, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 33.33333333}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 25.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 25.0}, {'min_range': 75.0, 'max_range': None, 'damage': 20.0}], 'recoil_amount_deg': 1.16, 'recoil_mean_direction_deg': 20.0, 'recoil_direction_variation_per_side_deg': 47.1, 'recoil_decay_factor': 104.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.459, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.392, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'kord6p67', 'class': 'Assault', 'weapon': 'KORD 6P67', 'rpm': 899.999, 'velocity_mps': 760.0, 'mag_size': 30, 'reload_s': 2.45, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 20.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 20.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 16.66666667}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.55, 'recoil_mean_direction_deg': 18.0, 'recoil_direction_variation_per_side_deg': 35.3, 'recoil_decay_factor': 55.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.023, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.21, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'nvo228e', 'class': 'Assault', 'weapon': 'NVO-228E', 'rpm': 654.545, 'velocity_mps': 671.0, 'mag_size': 30, 'reload_s': 2.5, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 27.25}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 21.4}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.75, 'recoil_mean_direction_deg': -12.0, 'recoil_direction_variation_per_side_deg': 36.8, 'recoil_decay_factor': 76.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.24, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.307, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'l85a3', 'class': 'Assault', 'weapon': 'L85A3', 'rpm': 635.294, 'velocity_mps': 814.0, 'mag_size': 30, 'reload_s': 2.767, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.67, 'recoil_mean_direction_deg': 12.0, 'recoil_direction_variation_per_side_deg': 29.4, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'vcr2', 'class': 'Assault', 'weapon': 'VCR-2', 'rpm': 899.999, 'velocity_mps': 704.0, 'mag_size': 30, 'reload_s': 2.434, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.81, 'recoil_mean_direction_deg': 18.0, 'recoil_direction_variation_per_side_deg': 64.9, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm16a4', 'class': 'Assault', 'weapon': 'M16A4', 'rpm': 771.0, 'velocity_mps': 720.0, 'mag_size': 30, 'reload_s': 2.2, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.71, 'recoil_mean_direction_deg': -21.0, 'recoil_direction_variation_per_side_deg': 46.4, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 7.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm4a1', 'class': 'Carbine', 'weapon': 'M4A1', 'rpm': 899.999, 'velocity_mps': 630.0, 'mag_size': 30, 'reload_s': 2.2, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 21.4}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 17.83333333}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.86, 'recoil_mean_direction_deg': -18.0, 'recoil_direction_variation_per_side_deg': 37.9, 'recoil_decay_factor': 57.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.045, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.228, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm277', 'class': 'Carbine', 'weapon': 'M277', 'rpm': 719.999, 'velocity_mps': 624.0, 'mag_size': 20, 'reload_s': 2.384, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 25.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 25.0}, {'min_range': 75.0, 'max_range': None, 'damage': 20.0}], 'recoil_amount_deg': 0.96, 'recoil_mean_direction_deg': -22.0, 'recoil_direction_variation_per_side_deg': 39.4, 'recoil_decay_factor': 76.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.24, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.307, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'ak205', 'class': 'Carbine', 'weapon': 'AK-205', 'rpm': 719.999, 'velocity_mps': 737.0, 'mag_size': 30, 'reload_s': 2.484, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 20.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 17.83333333}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 15.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.51, 'recoil_mean_direction_deg': 6.0, 'recoil_direction_variation_per_side_deg': 7.8, 'recoil_decay_factor': 48.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 0.905, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.179, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm417a2', 'class': 'Carbine', 'weapon': 'M417 A2', 'rpm': 654.545, 'velocity_mps': 600.0, 'mag_size': 20, 'reload_s': 2.467, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 27.25}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 21.4}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.95, 'recoil_mean_direction_deg': -16.0, 'recoil_direction_variation_per_side_deg': 19.8, 'recoil_decay_factor': 76.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.24, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.307, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'grtbc', 'class': 'Carbine', 'weapon': 'GRT-BC', 'rpm': 830.769, 'velocity_mps': 599.0, 'mag_size': 30, 'reload_s': 2.5, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 21.4}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 17.83333333}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.82, 'recoil_mean_direction_deg': 16.0, 'recoil_direction_variation_per_side_deg': 31.2, 'recoil_decay_factor': 57.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.045, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.228, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'qbz192', 'class': 'Carbine', 'weapon': 'QBZ-192', 'rpm': 771.428, 'velocity_mps': 644.0, 'mag_size': 30, 'reload_s': 2.567, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 21.4}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 17.83333333}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.78, 'recoil_mean_direction_deg': -10.0, 'recoil_direction_variation_per_side_deg': 23.5, 'recoil_decay_factor': 57.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.045, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.228, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'sg553r', 'class': 'Carbine', 'weapon': 'SG 553R', 'rpm': 719.999, 'velocity_mps': 519.0, 'mag_size': 30, 'reload_s': 2.5, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.82, 'recoil_mean_direction_deg': -20.0, 'recoil_direction_variation_per_side_deg': 43.3, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'sor300sc', 'class': 'Carbine', 'weapon': 'SOR-300SC', 'rpm': 599.999, 'velocity_mps': 563.0, 'mag_size': 30, 'reload_s': 2.25, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.76, 'recoil_mean_direction_deg': -12.0, 'recoil_direction_variation_per_side_deg': 19.2, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'sgx', 'class': 'SMG', 'weapon': 'SGX', 'rpm': 830.769, 'velocity_mps': 402.0, 'mag_size': 30, 'reload_s': 2.517, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 20.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 16.66666667}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.6, 'recoil_mean_direction_deg': -18.0, 'recoil_direction_variation_per_side_deg': 39.8, 'recoil_decay_factor': 55.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.023, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.21, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'pw5a3', 'class': 'SMG', 'weapon': 'PW5A3', 'rpm': 771.428, 'velocity_mps': 432.0, 'mag_size': 30, 'reload_s': 2.517, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 20.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 16.66666667}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.57, 'recoil_mean_direction_deg': -10.0, 'recoil_direction_variation_per_side_deg': 33.2, 'recoil_decay_factor': 55.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.023, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.21, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'pw7a2', 'class': 'SMG', 'weapon': 'PW7A2', 'rpm': 947.368, 'velocity_mps': 600.0, 'mag_size': 30, 'reload_s': 2.184, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 16.66666667}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 16.66666667}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 14.28571429}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.52, 'recoil_mean_direction_deg': -10.0, 'recoil_direction_variation_per_side_deg': 33.3, 'recoil_decay_factor': 46.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 0.919, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.166, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'umg40', 'class': 'SMG', 'weapon': 'UMG-40', 'rpm': 635.294, 'velocity_mps': 488.0, 'mag_size': 30, 'reload_s': 2.517, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 21.4}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 17.83333333}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.61, 'recoil_mean_direction_deg': -16.0, 'recoil_direction_variation_per_side_deg': 17.4, 'recoil_decay_factor': 57.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.045, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.228, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'usg90', 'class': 'SMG', 'weapon': 'USG-90', 'rpm': 899.999, 'velocity_mps': 570.0, 'mag_size': 50, 'reload_s': 3.0, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 20.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 17.83333333}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 15.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.56, 'recoil_mean_direction_deg': 10.0, 'recoil_direction_variation_per_side_deg': 42.8, 'recoil_decay_factor': 48.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 0.905, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.179, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'kv9', 'class': 'SMG', 'weapon': 'KV9', 'rpm': 1079.999, 'velocity_mps': 348.0, 'mag_size': 17, 'reload_s': 2.384, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 20.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 16.66666667}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.54, 'recoil_mean_direction_deg': 22.0, 'recoil_direction_variation_per_side_deg': 57.6, 'recoil_decay_factor': 55.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.023, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.21, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'scw10', 'class': 'SMG', 'weapon': 'SCW-10', 'rpm': 799.999, 'velocity_mps': 428.0, 'mag_size': 15, 'reload_s': 2.6, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.75, 'recoil_mean_direction_deg': -18.0, 'recoil_direction_variation_per_side_deg': 35.0, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'sl9', 'class': 'SMG', 'weapon': 'SL9', 'rpm': 674.999, 'velocity_mps': 510.0, 'mag_size': 30, 'reload_s': 2.65, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 20.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 16.66666667}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.53, 'recoil_mean_direction_deg': 0.0, 'recoil_direction_variation_per_side_deg': 16.2, 'recoil_decay_factor': 55.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.023, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.21, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'cz3a1', 'class': 'SMG', 'weapon': 'CZ3A1', 'rpm': 981.818, 'velocity_mps': 360.0, 'mag_size': 30, 'reload_s': 2.217, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 20.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 16.66666667}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 14.28571429}, {'min_range': 75.0, 'max_range': None, 'damage': 12.5}], 'recoil_amount_deg': 0.7, 'recoil_mean_direction_deg': -15.0, 'recoil_direction_variation_per_side_deg': 59.1, 'recoil_decay_factor': 55.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.023, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 6.0, 'spread_increase_per_shot_deg': 0.21, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'l110', 'class': 'LMG', 'weapon': 'L110', 'rpm': 719.999, 'velocity_mps': 780.0, 'mag_size': 100, 'reload_s': 6.5, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.56, 'recoil_mean_direction_deg': 0.0, 'recoil_direction_variation_per_side_deg': 39.4, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 11.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'drsiar', 'class': 'LMG', 'weapon': 'DRS-IAR', 'rpm': 771.428, 'velocity_mps': 720.0, 'mag_size': 30, 'reload_s': 2.467, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.7, 'recoil_mean_direction_deg': -14.0, 'recoil_direction_variation_per_side_deg': 35.2, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 9.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm60', 'class': 'LMG', 'weapon': 'M/60', 'rpm': 514.285, 'velocity_mps': 720.0, 'mag_size': 100, 'reload_s': 7.35, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 33.33333333}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 25.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 25.0}, {'min_range': 75.0, 'max_range': None, 'damage': 20.0}], 'recoil_amount_deg': 0.73, 'recoil_mean_direction_deg': 0.0, 'recoil_direction_variation_per_side_deg': 38.8, 'recoil_decay_factor': 104.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.459, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 11.0, 'spread_increase_per_shot_deg': 0.392, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'rpkm', 'class': 'LMG', 'weapon': 'RPKM', 'rpm': 553.846, 'velocity_mps': 670.0, 'mag_size': 40, 'reload_s': 2.8, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 27.25}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 21.4}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.66, 'recoil_mean_direction_deg': 5.0, 'recoil_direction_variation_per_side_deg': 22.7, 'recoil_decay_factor': 76.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.24, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 9.0, 'spread_increase_per_shot_deg': 0.307, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm123k', 'class': 'LMG', 'weapon': 'M123K', 'rpm': 830.769, 'velocity_mps': 670.0, 'mag_size': 100, 'reload_s': 6.65, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.61, 'recoil_mean_direction_deg': -10.0, 'recoil_direction_variation_per_side_deg': 55.9, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 11.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm250', 'class': 'LMG', 'weapon': 'M250', 'rpm': 674.999, 'velocity_mps': 760.0, 'mag_size': 50, 'reload_s': 5.75, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 25.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 25.0}, {'min_range': 75.0, 'max_range': None, 'damage': 25.0}], 'recoil_amount_deg': 0.73, 'recoil_mean_direction_deg': -14.0, 'recoil_direction_variation_per_side_deg': 39.7, 'recoil_decay_factor': 76.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.24, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 11.0, 'spread_increase_per_shot_deg': 0.307, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'kts100mk8', 'class': 'LMG', 'weapon': 'KTS100 MK8', 'rpm': 514.285, 'velocity_mps': 840.0, 'mag_size': 60, 'reload_s': 3.25, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 25.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 25.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 20.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 20.0}, {'min_range': 75.0, 'max_range': None, 'damage': 16.66666667}], 'recoil_amount_deg': 0.52, 'recoil_mean_direction_deg': 8.0, 'recoil_direction_variation_per_side_deg': 10.9, 'recoil_decay_factor': 72.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.2, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 9.0, 'spread_increase_per_shot_deg': 0.27, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm240l', 'class': 'LMG', 'weapon': 'M240L', 'rpm': 599.999, 'velocity_mps': 630.0, 'mag_size': 50, 'reload_s': 4.25, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 33.33333333}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 25.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 25.0}, {'min_range': 75.0, 'max_range': None, 'damage': 20.0}], 'recoil_amount_deg': 0.81, 'recoil_mean_direction_deg': 5.0, 'recoil_direction_variation_per_side_deg': 41.8, 'recoil_decay_factor': 104.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.459, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 11.0, 'spread_increase_per_shot_deg': 0.392, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'm121a2', 'class': 'LMG', 'weapon': 'M121 A2', 'rpm': 654.545, 'velocity_mps': 600.0, 'mag_size': 50, 'reload_s': 6.267, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 33.33333333}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 33.33333333}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 25.0}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 25.0}, {'min_range': 75.0, 'max_range': None, 'damage': 20.0}], 'recoil_amount_deg': 0.8, 'recoil_mean_direction_deg': -7.0, 'recoil_direction_variation_per_side_deg': 39.5, 'recoil_decay_factor': 104.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.459, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 11.0, 'spread_increase_per_shot_deg': 0.392, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}, {'id': 'rpk74m', 'class': 'LMG', 'weapon': 'RPK-74M', 'rpm': 685.0, 'velocity_mps': 840.0, 'mag_size': 45, 'reload_s': 2.784, 'damage_profile': [{'min_range': 0.0, 'max_range': 9.5, 'damage': 20.0}, {'min_range': 9.5, 'max_range': 21.5, 'damage': 20.0}, {'min_range': 21.5, 'max_range': 36.5, 'damage': 16.66666667}, {'min_range': 36.5, 'max_range': 75.0, 'damage': 16.66666667}, {'min_range': 75.0, 'max_range': None, 'damage': 14.28571429}], 'recoil_amount_deg': 0.48, 'recoil_mean_direction_deg': 6.0, 'recoil_direction_variation_per_side_deg': 18.9, 'recoil_decay_factor': 55.0, 'recoil_decay_exponent': 1.0, 'recoil_decay_time_exponent': 1.023, 'recoil_decay_offset': 0.06, 'ads_stand_min_deg': 0.05, 'ads_stand_max_deg': 11.0, 'spread_increase_per_shot_deg': 0.21, 'spread_first_shot_multiplier': 1.0, 'spread_firing_decrease_coefficient': 1.22, 'spread_firing_decrease_exponent': 2.5, 'spread_firing_decrease_offset': 1.84, 'spread_not_firing_decrease_coefficient': 0.0, 'spread_not_firing_decrease_exponent': 0.25, 'spread_not_firing_decrease_offset': 7.2, 'spread_radial_distribution_exponent': 0.67, 'source_model_version': 'pre-1.3.3.0'}]
+WEAPON_BY_ID = {weapon["id"]: weapon for weapon in WEAPON_DATA}
 
 
-# =========================
-# 계산 함수
-# =========================
+# ============================================================
+# Lightweight cache decorator for self-test environments
+# ============================================================
 
-def ceil_damage(value: float, decimals: int = DAMAGE_CEIL_DECIMALS) -> float:
-    """
-    데미지를 지정한 소수 자리까지 올림 처리한다.
+def _cache_data(**kwargs: Any) -> Callable:
+    if st is None:
+        return lambda function: function
+    return st.cache_data(**kwargs)
 
-    이유:
-    - 원본 데이터의 33.33333333 같은 값은 3발 합산 시 99.99999999가 될 수 있다.
-    - 실제 게임에서는 이런 값도 100 데미지 사망 판정으로 취급되므로,
-      계산상 STK가 1발 더 늘어나는 문제를 막기 위해 데미지 자체를 올림한다.
-    """
-    factor = 10 ** decimals
+
+# ============================================================
+# Target geometry
+# ============================================================
+
+@dataclass(frozen=True)
+class TargetGeometry:
+    aim_y_m: float = AIM_POINT_Y_M
+    head_half_width_m: float = 0.09
+    head_half_height_m: float = 0.115
+    head_center_y_m: float = 1.635
+
+
+TARGET = TargetGeometry()
+
+
+def _capsule_mask(
+    x: np.ndarray,
+    y: np.ndarray,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+    radius: float,
+) -> np.ndarray:
+    abx = bx - ax
+    aby = by - ay
+    denominator = max(abx * abx + aby * aby, 1e-12)
+    t = ((x - ax) * abx + (y - ay) * aby) / denominator
+    t = np.clip(t, 0.0, 1.0)
+    nearest_x = ax + t * abx
+    nearest_y = ay + t * aby
+    return (x - nearest_x) ** 2 + (y - nearest_y) ** 2 <= radius**2
+
+
+def classify_target(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (any_hit, head_hit) for the fixed front-facing standing target."""
+    head = (
+        (x / TARGET.head_half_width_m) ** 2
+        + ((y - TARGET.head_center_y_m) / TARGET.head_half_height_m) ** 2
+        <= 1.0
+    )
+
+    neck = (np.abs(x) <= 0.07) & (y >= 1.48) & (y < 1.52)
+    chest = (np.abs(x) <= 0.20) & (y >= 1.15) & (y < 1.48)
+    abdomen_pelvis = (np.abs(x) <= 0.18) & (y >= 0.86) & (y < 1.15)
+
+    upper_arms = (
+        _capsule_mask(x, y, -0.20, 1.42, -0.28, 1.24, 0.050)
+        | _capsule_mask(x, y, 0.20, 1.42, 0.28, 1.24, 0.050)
+    )
+    forearms_hands = (
+        _capsule_mask(x, y, -0.28, 1.24, -0.07, 1.29, 0.045)
+        | _capsule_mask(x, y, 0.28, 1.24, 0.07, 1.29, 0.045)
+    )
+    legs_feet = (
+        _capsule_mask(x, y, -0.095, 0.86, -0.095, 0.09, 0.075)
+        | _capsule_mask(x, y, 0.095, 0.86, 0.095, 0.09, 0.075)
+        | _capsule_mask(x, y, -0.095, 0.09, -0.13, 0.025, 0.070)
+        | _capsule_mask(x, y, 0.095, 0.09, 0.13, 0.025, 0.070)
+    )
+
+    body = neck | chest | abdomen_pelvis | upper_arms | forearms_hands | legs_feet
+    return head | body, head
+
+
+# ============================================================
+# Damage model
+# ============================================================
+
+def _ceil_damage(value: float, decimals: int = 3) -> float:
+    factor = 10**decimals
     return math.ceil(float(value) * factor - 1e-12) / factor
 
 
-def get_raw_damage_at_range(profile: List[Dict], distance: float) -> float:
-    """거리별 데미지 프로필에서 반올림 전 원시 데미지를 반환한다."""
-    if not profile:
-        return 0.0
-
-    for item in profile:
-        min_range = float(item["min_range"])
-        max_range = item["max_range"]
-        max_range_value = math.inf if max_range is None else float(max_range)
-
-        if min_range <= distance < max_range_value:
-            return float(item["damage"])
-
-    return float(profile[-1]["damage"])
+def damage_at_distance(profile: list[dict[str, Any]], distance_m: float) -> float:
+    distance = max(float(distance_m), 0.0)
+    for row in profile:
+        lower = float(row["min_range"])
+        upper = row["max_range"]
+        if lower <= distance and (upper is None or distance < float(upper)):
+            return _ceil_damage(float(row["damage"]))
+    return _ceil_damage(float(profile[-1]["damage"]))
 
 
-def get_damage_at_range(
-    profile: List[Dict],
-    distance: float,
-    multiplier: float = 1.0,
+# ============================================================
+# Recoil and spread recovery
+# ============================================================
+
+def _recoil_affine_coefficients(
+    factor: float,
+    exponent: float,
+    time_exponent: float,
+    duration_s: float,
+    offset: float,
+) -> tuple[float, float] | None:
+    """
+    For exponent == 1, collapse the 60 Hz recurrence into:
+        magnitude_new = max(0, A * magnitude_old - B)
+    """
+    if abs(exponent - 1.0) > 1e-12:
+        return None
+
+    a_total = 1.0
+    b_total = 0.0
+    elapsed = 0.0
+    while elapsed < duration_s - 1e-12:
+        step = min(SIMULATION_FRAME_S, duration_s - elapsed)
+        elapsed += step
+        coefficient = factor * step * (elapsed**time_exponent)
+        a_total = (1.0 - coefficient) * a_total
+        b_total = (1.0 - coefficient) * b_total + coefficient * offset
+    return a_total, b_total
+
+
+def recover_recoil_axis(
+    values: np.ndarray,
+    factor: float,
+    exponent: float,
+    time_exponent: float,
+    duration_s: float,
+    offset: float,
+) -> np.ndarray:
+    if duration_s <= 0:
+        return values
+
+    affine = _recoil_affine_coefficients(
+        factor=factor,
+        exponent=exponent,
+        time_exponent=time_exponent,
+        duration_s=duration_s,
+        offset=offset,
+    )
+    if affine is not None:
+        a_total, b_total = affine
+        return np.sign(values) * np.maximum(0.0, a_total * np.abs(values) - b_total)
+
+    output = values
+    elapsed = 0.0
+    while elapsed < duration_s - 1e-12:
+        step = min(SIMULATION_FRAME_S, duration_s - elapsed)
+        elapsed += step
+        decay = (
+            (np.abs(output) ** exponent + offset)
+            * factor
+            * step
+            * (elapsed**time_exponent)
+        )
+        output = np.sign(output) * np.maximum(0.0, np.abs(output) - decay)
+    return output
+
+
+def recover_spread(
+    spread_deg: float,
+    minimum_deg: float,
+    maximum_deg: float,
+    duration_s: float,
+    coefficient: float,
+    exponent: float,
+    offset: float,
 ) -> float:
-    """거리 데미지에 신체/방탄판 배율을 적용한 뒤 소수점 셋째 자리까지 올림한다."""
-    raw_damage = get_raw_damage_at_range(profile, distance)
-    return ceil_damage(raw_damage * float(multiplier))
+    output = float(spread_deg)
+    elapsed = 0.0
+    while elapsed < duration_s - 1e-12:
+        step = min(SIMULATION_FRAME_S, duration_s - elapsed)
+        elapsed += step
+        excess = max(output - minimum_deg, 0.0)
+        output -= step * (coefficient * excess**exponent + offset)
+        output = min(maximum_deg, max(minimum_deg, output))
+    return output
 
 
-def damage_multiplier_for_hit(
-    weapon_type: str,
-    hit_zone: str = "chest",
-    armor_active: bool = False,
-) -> float:
-    """Update 1.3.3.0 기준 신체 부위 및 방탄판 피해 배율을 반환한다."""
-    type_name = str(weapon_type).strip().lower()
-    zone = str(hit_zone).strip().lower()
+# ============================================================
+# Monte Carlo engine
+# ============================================================
 
-    if type_name in AUTOMATIC_PRIMARY_TYPES:
-        if armor_active or zone == "lower_body":
-            return 0.84
-        return 1.0
-
-    if type_name == "dmr":
-        if armor_active or zone == "lower_body":
-            return 0.91
-        return 1.0
-
-    # 현재 앱에 저격소총 데이터는 없지만, 향후 추가 시 공식 배율을 그대로 사용한다.
-    if type_name in {"sniper", "sniper rifle", "bolt-action", "bolt action"}:
-        if armor_active or zone == "lower_body":
-            return 0.67
-        return 1.0
-
-    # Update 1.3.3.0에서 산탄총과 보조무기는 신체 배율 변경 대상에서 제외됐다.
-    return 1.0
+def _seed_for_condition(distance_m: int) -> int:
+    # Same random stream for every weapon at a distance: common random numbers
+    # reduce comparison noise between weapons.
+    return BASE_RANDOM_SEED + int(distance_m) * 10_007
 
 
-def armor_range_penalty_applies(weapon_type: str) -> bool:
-    """
-    방탄판이 남아 있을 때 거리 +10m 데미지 모델 후퇴를 적용할지 결정한다.
+@_cache_data(show_spinner=False, max_entries=512)
+def simulate_weapon(
+    weapon_id: str,
+    distance_m: int,
+    trials: int = TRIALS_PER_WEAPON,
+    vertical_recoil_control_percent: int = DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT,
+) -> dict[str, Any]:
+    weapon = WEAPON_BY_ID[weapon_id]
+    trials = int(trials)
+    if trials <= 0:
+        raise ValueError("trials must be positive")
 
-    현재 규칙:
-    - DMR, Sidearm: 적용하지 않음
-    - 그 외: 적용
-    """
-    return str(weapon_type).strip().lower() not in ARMOR_RANGE_PENALTY_EXEMPT_TYPES
+    vertical_recoil_control_percent = int(vertical_recoil_control_percent)
+    if vertical_recoil_control_percent not in VERTICAL_RECOIL_CONTROL_OPTIONS:
+        raise ValueError(
+            "vertical_recoil_control_percent must be one of "
+            f"{VERTICAL_RECOIL_CONTROL_OPTIONS}"
+        )
+    vertical_recoil_remaining = np.float32(
+        1.0 - vertical_recoil_control_percent / 100.0
+    )
 
+    rng = np.random.default_rng(_seed_for_condition(distance_m))
 
-def effective_distance_against_armor(
-    weapon_type: str,
-    distance: float,
-    armor_range_penalty: float = ARMOR_RANGE_PENALTY,
-) -> float:
-    """방탄판이 남아 있을 때 해당 탄환에 적용할 거리."""
-    if armor_range_penalty_applies(weapon_type):
-        return distance + armor_range_penalty
-    return distance
+    health = np.full(trials, TARGET_HEALTH, dtype=np.float32)
+    alive = np.ones(trials, dtype=bool)
+    recoil_x = np.zeros(trials, dtype=np.float32)
+    recoil_y = np.zeros(trials, dtype=np.float32)
 
+    kill_shot = np.zeros(trials, dtype=np.int16)
+    kill_time_s = np.full(trials, np.nan, dtype=np.float32)
+    hits_before_kill = np.zeros(trials, dtype=np.int16)
 
-def calculate_ttk(
-    profile: List[Dict],
-    rpm: float,
-    distance: float,
-    armor_plates: int,
-    weapon_type: str = "",
-    hit_zone: str = "chest",
-    base_health: float = DEFAULT_HEALTH,
-    armor_hp_per_plate: float = ARMOR_HP_PER_PLATE,
-    armor_range_penalty: float = ARMOR_RANGE_PENALTY,
-    max_shots: int = 200,
-) -> Dict:
-    """
-    한 발씩 순차 계산한다.
+    rpm = float(weapon["rpm"])
+    normal_interval_s = 60.0 / rpm
+    magazine_size = max(int(weapon["mag_size"]), 1)
+    reload_s = float(weapon["reload_s"])
+    rounds_since_reload = 0
+    time_s = 0.0
 
-    규칙:
-    - 방탄판 0장: HP 100, 실제 거리 기준 데미지
-    - 방탄판 1장: Armor 40 + HP 100
-    - 방탄판 2장: Armor 80 + HP 100
-    - 방탄판이 1이라도 남아 있으면 해당 탄환은 거리 +10m 데미지 적용
-    - 단, DMR과 Sidearm은 방탄판이 있어도 거리 +10m 후퇴를 적용하지 않음
-    - Update 1.3.3.0 방탄판 배율: 자동화기 0.84x, DMR 0.91x, 저격소총 0.67x
-    - 복부·팔다리 배율도 자동화기 0.84x, DMR 0.91x, 저격소총 0.67x
-    - 방탄판 초과 피해는 HP로 넘어간다.
-    """
-    health = float(base_health)
-    armor_hp = float(armor_plates * armor_hp_per_plate)
-    shot_count = 0
+    spread_min = float(weapon["ads_stand_min_deg"])
+    spread_max = float(weapon["ads_stand_max_deg"])
+    spread_deg = spread_min
 
-    while health > 0 and shot_count < max_shots:
-        shot_count += 1
+    recoil_amount = np.float32(weapon["recoil_amount_deg"])
+    recoil_mean = np.float32(weapon["recoil_mean_direction_deg"])
+    recoil_variation = float(weapon["recoil_direction_variation_per_side_deg"])
+    body_damage = np.float32(damage_at_distance(weapon["damage_profile"], distance_m))
+    head_damage = np.float32(_ceil_damage(float(body_damage) * HEAD_MULTIPLIER))
 
-        if armor_hp > 0:
-            effective_distance = effective_distance_against_armor(
-                weapon_type=weapon_type,
-                distance=distance,
-                armor_range_penalty=armor_range_penalty,
+    low_accuracy_shot_count = 0
+    first_low_accuracy_shot: int | None = None
+    shot_hit_rates: list[float] = []
+
+    for shot_number in range(1, MAX_SHOTS + 1):
+        # 1) Spread around the current recoil-displaced aim direction.
+        radial_random = rng.random(trials, dtype=np.float32)
+        azimuth = rng.random(trials, dtype=np.float32) * np.float32(2.0 * math.pi)
+        radial_exponent = np.float32(weapon["spread_radial_distribution_exponent"])
+        radius_deg = np.float32(spread_deg) * radial_random**radial_exponent
+
+        bullet_angle_x_deg = recoil_x + radius_deg * np.cos(azimuth)
+        bullet_angle_y_deg = recoil_y + radius_deg * np.sin(azimuth)
+
+        impact_x_m = np.float32(distance_m) * np.tan(np.deg2rad(bullet_angle_x_deg))
+        impact_y_m = np.float32(AIM_POINT_Y_M) + np.float32(distance_m) * np.tan(
+            np.deg2rad(bullet_angle_y_deg)
+        )
+
+        hit, head = classify_target(impact_x_m, impact_y_m)
+        shot_hit_rate = float(hit.mean())
+        shot_hit_rates.append(shot_hit_rate)
+
+        # 2) Apply damage only to engagements that are still alive.
+        active_hit = alive & hit
+        hits_before_kill += active_hit.astype(np.int16)
+        damage = np.where(head, head_damage, body_damage)
+        health -= damage * active_hit
+
+        newly_killed = alive & (health <= DAMAGE_EPSILON)
+        kill_shot[newly_killed] = shot_number
+        kill_time_s[newly_killed] = time_s
+        alive[newly_killed] = False
+
+        # No following-shot state is needed once every trial is dead.
+        if not np.any(alive):
+            break
+
+        # 3) This shot's recoil affects the next shot.
+        # Sym direction variation is used exactly as mean ± per-side variation.
+        recoil_direction_deg = recoil_mean + rng.uniform(
+            -recoil_variation,
+            recoil_variation,
+            size=trials,
+        ).astype(np.float32)
+        direction_rad = np.deg2rad(recoil_direction_deg)
+        # Player control affects only the vertical component of each new kick.
+        # Horizontal recoil is deliberately left unchanged. For example, 70%
+        # control leaves 30% of the sampled vertical kick in the weapon state.
+        recoil_x += -recoil_amount * np.sin(direction_rad)
+        recoil_y += (
+            recoil_amount * np.cos(direction_rad) * vertical_recoil_remaining
+        )
+
+        # 4) Increase spread after firing.
+        spread_increment = float(weapon["spread_increase_per_shot_deg"])
+        if shot_number == 1:
+            spread_increment *= float(weapon["spread_first_shot_multiplier"])
+        spread_deg = min(spread_max, spread_deg + spread_increment)
+
+        # 5) Decide the interval before the next shot.
+        rounds_since_reload += 1
+        low_accuracy = shot_hit_rate <= LOW_ACCURACY_THRESHOLD
+        if low_accuracy:
+            low_accuracy_shot_count += 1
+            if first_low_accuracy_shot is None:
+                first_low_accuracy_shot = shot_number
+
+        if rounds_since_reload >= magazine_size:
+            interval_s = reload_s
+            rounds_since_reload = 0
+            recoil_x.fill(0.0)
+            recoil_y.fill(0.0)
+            spread_deg = spread_min
+        else:
+            interval_s = (
+                max(normal_interval_s, LOW_ACCURACY_INTERVAL_S)
+                if low_accuracy
+                else normal_interval_s
             )
-        else:
-            effective_distance = distance
 
-        multiplier = damage_multiplier_for_hit(
-            weapon_type=weapon_type,
-            hit_zone=hit_zone,
-            armor_active=armor_hp > 0,
-        )
-        damage = get_damage_at_range(
-            profile,
-            effective_distance,
-            multiplier=multiplier,
-        )
+            recoil_x = recover_recoil_axis(
+                recoil_x,
+                factor=float(weapon["recoil_decay_factor"]),
+                exponent=float(weapon["recoil_decay_exponent"]),
+                time_exponent=float(weapon["recoil_decay_time_exponent"]),
+                duration_s=interval_s,
+                offset=float(weapon["recoil_decay_offset"]),
+            )
+            recoil_y = recover_recoil_axis(
+                recoil_y,
+                factor=float(weapon["recoil_decay_factor"]),
+                exponent=float(weapon["recoil_decay_exponent"]),
+                time_exponent=float(weapon["recoil_decay_time_exponent"]),
+                duration_s=interval_s,
+                offset=float(weapon["recoil_decay_offset"]),
+            )
 
-        if armor_hp > 0:
-            if damage <= armor_hp:
-                armor_hp -= damage
-            else:
-                overflow = damage - armor_hp
-                armor_hp = 0.0
-                health -= overflow
-        else:
-            health -= damage
+            # The normal shot interval uses firing recovery. Any extra part of the
+            # 0.2 s pause uses not-firing recovery.
+            firing_recovery_s = min(normal_interval_s, interval_s)
+            spread_deg = recover_spread(
+                spread_deg,
+                minimum_deg=spread_min,
+                maximum_deg=spread_max,
+                duration_s=firing_recovery_s,
+                coefficient=float(weapon["spread_firing_decrease_coefficient"]),
+                exponent=float(weapon["spread_firing_decrease_exponent"]),
+                offset=float(weapon["spread_firing_decrease_offset"]),
+            )
 
-    ttk = None if rpm <= 0 else (shot_count - 1) * (60.0 / rpm)
+            non_firing_recovery_s = max(0.0, interval_s - firing_recovery_s)
+            if non_firing_recovery_s > 0:
+                spread_deg = recover_spread(
+                    spread_deg,
+                    minimum_deg=spread_min,
+                    maximum_deg=spread_max,
+                    duration_s=non_firing_recovery_s,
+                    coefficient=float(weapon["spread_not_firing_decrease_coefficient"]),
+                    exponent=float(weapon["spread_not_firing_decrease_exponent"]),
+                    offset=float(weapon["spread_not_firing_decrease_offset"]),
+                )
 
-    return {
-        "shots_to_kill": shot_count,
-        "ttk": ttk,
-        "final_health": max(health, 0),
-        "final_armor": max(armor_hp, 0),
-    }
+        time_s += interval_s
 
+    killed = kill_shot > 0
+    killed_count = int(killed.sum())
+    kill_probability = killed_count / trials
 
-def calculate_accuracy_stats(
-    shots_to_kill: int,
-    rpm: float,
-    accuracy_percent: float,
-) -> Dict:
-    """
-    개인 명중률을 반영한 평균 처치 시간과 표준편차를 계산한다.
-
-    모델:
-    - 필요한 명중탄 수 k = 기존 STK
-    - 각 탄환은 독립적으로 p 확률로 명중
-    - 총 N발을 쏴서 k번째 명중이 발생하는 순간 처치
-    - N은 음이항분포를 따른다.
-    - 재장전 시간은 반영하지 않는다.
-
-    공식:
-    - E[N] = k / p
-    - Var(N) = k(1-p) / p^2
-    - Time = (N - 1) * shot_interval
-    """
-    k = int(shots_to_kill)
-    p = float(accuracy_percent) / 100.0
-
-    if k <= 0 or rpm <= 0 or p <= 0:
+    if killed_count == 0:
         return {
-            "mean_time_sec": None,
-            "sigma_time_sec": None,
-            "expected_shots": None,
-            "coverage": 0.0,
+            "class": weapon["class"],
+            "weapon": weapon["weapon"],
+            "rpm": rpm,
+            "distance_m": int(distance_m),
+            "trials": trials,
+            "vertical_recoil_control_percent": vertical_recoil_control_percent,
+            "practical_stk_mean": math.nan,
+            "practical_stk_median": math.nan,
+            "practical_stk_p80": math.nan,
+            "ttk_mean_s": math.nan,
+            "ttk_median_s": math.nan,
+            "ttk_p80_s": math.nan,
+            "accuracy": math.nan,
+            "kill_probability": 0.0,
+            "first_low_accuracy_shot": first_low_accuracy_shot,
+            "low_accuracy_shot_count": low_accuracy_shot_count,
         }
 
-    shot_interval = 60.0 / float(rpm)
-
-    expected_shots = k / p
-    variance_shots = k * (1.0 - p) / (p ** 2)
-
-    mean_time = (expected_shots - 1.0) * shot_interval
-    sigma_time = math.sqrt(max(0.0, variance_shots)) * shot_interval
+    successful_shots = kill_shot[killed].astype(np.float64)
+    successful_times = kill_time_s[killed].astype(np.float64)
+    total_fired = float(successful_shots.sum())
+    total_hits = float(hits_before_kill[killed].sum())
 
     return {
-        "mean_time_sec": mean_time,
-        "sigma_time_sec": sigma_time,
-        "expected_shots": expected_shots,
-        "coverage": 1.0,
-    }
-
-def negative_binomial_distribution(
-    shots_to_kill: int,
-    rpm: float,
-    accuracy_percent: float,
-    cdf_cutoff: float = 0.999,
-    max_shots_cap: int = 2500,
-) -> pd.DataFrame:
-    """
-    개인 명중률 기반 처치 시간의 실제 확률분포를 만든다.
-
-    N = k번째 명중이 발생하는 총 발사탄 수
-    P(N=n) = C(n-1, k-1) * p^k * (1-p)^(n-k)
-
-    반환값:
-    - fired_shots: 총 발사탄 수 N
-    - kill_time_sec: (N-1) * 발사간격
-    - probability: 해당 발사탄 수에서 처치될 확률
-    - cumulative_probability: 그 시간까지 처치될 누적확률
-    """
-    k = int(shots_to_kill)
-    p = float(accuracy_percent) / 100.0
-
-    if k <= 0 or rpm <= 0 or p <= 0:
-        return pd.DataFrame()
-
-    p = min(max(p, 1e-9), 1.0)
-    q = 1.0 - p
-    shot_interval = 60.0 / float(rpm)
-
-    if p >= 1.0:
-        return pd.DataFrame([{
-            "fired_shots": k,
-            "kill_time_sec": (k - 1) * shot_interval,
-            "probability": 1.0,
-            "cumulative_probability": 1.0,
-        }])
-
-    expected_shots = k / p
-    variance_shots = k * q / (p ** 2)
-    sigma_shots = math.sqrt(max(0.0, variance_shots))
-
-    # 평균 + 10σ 정도까지 보되, 너무 긴 꼬리 때문에 화면/연산이 과도해지는 것은 막는다.
-    dynamic_cap = int(math.ceil(expected_shots + 10.0 * sigma_shots + 20))
-    max_shots = max(k, min(max(dynamic_cap, 80), max_shots_cap))
-
-    rows = []
-    n = k
-    probability = p ** k
-    cumulative = 0.0
-
-    while n <= max_shots:
-        cumulative += probability
-        rows.append({
-            "fired_shots": n,
-            "kill_time_sec": (n - 1) * shot_interval,
-            "probability": probability,
-            "cumulative_probability": min(cumulative, 1.0),
-        })
-
-        if cumulative >= cdf_cutoff:
-            break
-
-        # P(N=n+1) = P(N=n) * n/(n+1-k) * (1-p)
-        next_denominator = n + 1 - k
-        if next_denominator <= 0:
-            break
-
-        probability = probability * (n / next_denominator) * q
-        n += 1
-
-        if probability <= 0 and cumulative > 0:
-            break
-
-    return pd.DataFrame(rows)
-
-
-def distribution_quantile(distribution_df: pd.DataFrame, probability: float):
-    """
-    누적확률이 probability 이상이 되는 최초 처치 시간을 반환한다.
-    """
-    if distribution_df.empty:
-        return None
-
-    matched = distribution_df[distribution_df["cumulative_probability"] >= probability]
-    if matched.empty:
-        return None
-
-    return float(matched.iloc[0]["kill_time_sec"])
-
-
-def default_accuracy_for_weapon(weapon: Dict) -> float:
-    """
-    무기 타입별 기본 개인 명중률.
-    - Assault, Carbine: 25%
-    - SMG, LMG: 20%
-    - DMR, Sidearm: 33%
-    - 그 외: 25%
-    """
-    type_name = str(weapon.get("type", "")).strip().lower()
-    if type_name in ["assault", "carbine"]:
-        return 25.0
-    if type_name in ["smg", "lmg"]:
-        return 20.0
-    if type_name in ["dmr", "sidearm"]:
-        return 33.0
-    return 25.0
-
-def weapon_result_row(
-    weapon: Dict,
-    distance: float,
-    armor_plates: int,
-    hit_zone: str = "chest",
-) -> Dict:
-    profile = weapon["damage_profile"]
-    rpm = float(weapon["rpm"])
-    weapon_type = weapon.get("type", "")
-    result = calculate_ttk(
-        profile=profile,
-        rpm=rpm,
-        distance=distance,
-        armor_plates=armor_plates,
-        weapon_type=weapon_type,
-        hit_zone=hit_zone,
-    )
-
-    normal_multiplier = damage_multiplier_for_hit(
-        weapon_type=weapon_type,
-        hit_zone=hit_zone,
-        armor_active=False,
-    )
-    armor_multiplier = damage_multiplier_for_hit(
-        weapon_type=weapon_type,
-        hit_zone=hit_zone,
-        armor_active=True,
-    )
-    actual_damage = get_damage_at_range(
-        profile,
-        distance,
-        multiplier=normal_multiplier,
-    )
-    armor_effective_distance = effective_distance_against_armor(
-        weapon_type=weapon_type,
-        distance=distance,
-    )
-    armor_damage = get_damage_at_range(
-        profile,
-        armor_effective_distance,
-        multiplier=armor_multiplier,
-    )
-
-    return {
-        "type": weapon["type"],
+        "class": weapon["class"],
         "weapon": weapon["weapon"],
         "rpm": rpm,
-        "firing_mode": weapon.get("firing_mode", ""),
-        "mag_size": weapon.get("mag_size"),
-        "reload": weapon.get("reload"),
-        "velocity": weapon.get("velocity"),
-        "distance": distance,
-        "hit_zone": hit_zone,
-        "hit_zone_label": HIT_ZONE_LABELS.get(hit_zone, hit_zone),
-        "armor_plates": armor_plates,
-        "normal_damage_multiplier": normal_multiplier,
-        "armor_damage_multiplier": armor_multiplier,
-        "normal_damage_at_distance": actual_damage,
-        "armor_effective_distance": armor_effective_distance,
-        "armor_damage_at_effective_distance": armor_damage,
-        "shots_to_kill": result["shots_to_kill"],
-        "ttk_sec": result["ttk"],
+        "distance_m": int(distance_m),
+        "trials": trials,
+        "vertical_recoil_control_percent": vertical_recoil_control_percent,
+        "practical_stk_mean": float(successful_shots.mean()),
+        "practical_stk_median": float(np.median(successful_shots)),
+        "practical_stk_p80": float(np.quantile(successful_shots, 0.80)),
+        "ttk_mean_s": float(successful_times.mean()),
+        "ttk_median_s": float(np.median(successful_times)),
+        "ttk_p80_s": float(np.quantile(successful_times, 0.80)),
+        "accuracy": total_hits / total_fired if total_fired else math.nan,
+        "kill_probability": kill_probability,
+        "first_low_accuracy_shot": first_low_accuracy_shot,
+        "low_accuracy_shot_count": low_accuracy_shot_count,
     }
 
 
-def sweep_weapon(
-    weapon: Dict,
-    armor_plates: int,
-    max_distance: int = 100,
-    hit_zone: str = "chest",
+@_cache_data(show_spinner=False, max_entries=64)
+def simulate_all_weapons(
+    distance_m: int,
+    trials: int = TRIALS_PER_WEAPON,
+    vertical_recoil_control_percent: int = DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT,
 ) -> pd.DataFrame:
-    rows = []
-    for distance in range(0, max_distance + 1):
-        rows.append(
-            weapon_result_row(
-                weapon=weapon,
-                distance=float(distance),
-                armor_plates=armor_plates,
-                hit_zone=hit_zone,
-            )
+    rows = [
+        simulate_weapon(
+            weapon["id"],
+            int(distance_m),
+            int(trials),
+            int(vertical_recoil_control_percent),
         )
-    return pd.DataFrame(rows)
-
-
-def damage_profile_to_text(profile: List[Dict]) -> str:
-    parts = []
-    for item in profile:
-        min_range = item["min_range"]
-        max_range = item["max_range"]
-        damage = item["damage"]
-        if max_range is None:
-            label = f"{min_range:g}m+"
-        else:
-            label = f"{min_range:g}-{max_range:g}m"
-        parts.append(f"{label}: {damage:g}")
-    return " / ".join(parts)
-
-
-def hex_to_rgba(hex_color: str, alpha: float) -> str:
-    """Plotly 기본 색상(hex)을 투명도 있는 rgba 문자열로 변환한다."""
-    color = str(hex_color).strip()
-    if color.startswith("#") and len(color) == 7:
-        r = int(color[1:3], 16)
-        g = int(color[3:5], 16)
-        b = int(color[5:7], 16)
-        return f"rgba({r}, {g}, {b}, {alpha})"
-    if color.startswith("rgb("):
-        return color.replace("rgb(", "rgba(").replace(")", f", {alpha})")
-    return f"rgba(80, 80, 80, {alpha})"
-
-
-def _hex_to_rgb_tuple(hex_color: str):
-    color = str(hex_color).strip().lstrip("#")
-    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
-
-
-def _rgb_tuple_to_hex(rgb_tuple) -> str:
-    r, g, b = rgb_tuple
-    return f"#{int(round(r)):02x}{int(round(g)):02x}{int(round(b)):02x}"
-
-
-def _interpolate_color(hex_a: str, hex_b: str, t: float) -> str:
-    ar, ag, ab = _hex_to_rgb_tuple(hex_a)
-    br, bg, bb = _hex_to_rgb_tuple(hex_b)
-    return _rgb_tuple_to_hex((
-        ar + (br - ar) * t,
-        ag + (bg - ag) * t,
-        ab + (bb - ab) * t,
-    ))
-
-
-def ranked_rainbow_colors(count: int) -> List[str]:
-    """표준편차 순위에 맞춰 높은 값부터 낮은 값까지 사용할 색상표를 만든다."""
-    if count <= 0:
-        return []
-    if count == 1:
-        return ["#ff0000"]
-    if count == 2:
-        return ["#ff0000", "#0000ff"]
-    if count == 3:
-        return ["#ff0000", "#00aa00", "#0000ff"]
-    if count == 4:
-        return ["#ff0000", "#ffff00", "#00aa00", "#0000ff"]
-
-    stops = [
-        "#ff0000",  # red
-        "#ff7f00",  # orange
-        "#ffff00",  # yellow
-        "#00aa00",  # green
-        "#0066ff",  # blue
-        "#4b0082",  # indigo
-        "#8a2be2",  # violet
+        for weapon in WEAPON_DATA
     ]
-    if count == len(stops):
-        return stops
-
-    result = []
-    max_pos = len(stops) - 1
-    for idx in range(count):
-        pos = idx * max_pos / (count - 1)
-        left = int(math.floor(pos))
-        right = int(math.ceil(pos))
-        if left == right:
-            result.append(stops[left])
-        else:
-            result.append(_interpolate_color(stops[left], stops[right], pos - left))
-    return result
-
-
-def color_map_by_sigma(accuracy_df: pd.DataFrame, selected_weapon_order: List[str]) -> Dict[str, str]:
-    """σ가 큰 총기일수록 빨간색, 작은 총기일수록 보라색/파란색에 가깝게 배정한다."""
-    if accuracy_df.empty:
-        return {}
-
-    order_index = {weapon_name: idx for idx, weapon_name in enumerate(selected_weapon_order)}
-    ranking_df = accuracy_df[["weapon", "sigma_sec"]].copy()
-    ranking_df["_order"] = ranking_df["weapon"].map(order_index).fillna(999999)
-    ranking_df = ranking_df.sort_values(["sigma_sec", "_order"], ascending=[False, True])
-
-    colors = ranked_rainbow_colors(len(ranking_df))
-    return {weapon_name: colors[idx] for idx, weapon_name in enumerate(ranking_df["weapon"].tolist())}
-
-
-def line_dash_map_for_weapons(selected_weapon_order: List[str]) -> Dict[str, str]:
-    """
-    음이항분포 곡선이 완전히 겹칠 때도 구분되도록 총기마다 다른 선 모양을 부여한다.
-    Plotly line.dash는 기본 문자열과 CSS식 px 배열을 모두 지원한다.
-    """
-    if not selected_weapon_order:
-        return {}
-
-    # 1개만 볼 때는 가독성을 위해 실선.
-    if len(selected_weapon_order) == 1:
-        return {selected_weapon_order[0]: "solid"}
-
-    dash_patterns = [
-        "dash",                       # 긴 점선
-        "dot",                        # 점선
-        "longdash",                   # 더 긴 점선
-        "dashdot",                    # 점-선 혼합
-        "longdashdot",                # 긴 점-선 혼합
-        "1px,5px",                    # 촘촘한 점선
-        "3px,3px,10px,3px",           # 짧은 선 + 긴 선
-        "10px,2px,2px,2px",           # 긴 선 + 짧은 점
-        "2px,2px,2px,6px",            # 2중 점선
-        "12px,4px,4px,4px,4px,4px",   # 긴 선 + 2중 짧은 선
-        "6px,2px,1px,2px,1px,2px",    # 선 + 2중 점
-        "14px,3px,2px,3px",           # 매우 긴 선 + 점
-    ]
-
-    return {
-        weapon_name: dash_patterns[idx % len(dash_patterns)]
-        for idx, weapon_name in enumerate(selected_weapon_order)
-    }
-
-
-# =========================
-# 반동 기반 1:1 승률 비교 모델
-# =========================
-
-DUEL_ELIGIBLE_TYPES = {"Assault", "Carbine", "SMG", "LMG", "Sidearm"}
-
-DUEL_BASE_ACCURACY_UNTIL_15M = 0.25
-DUEL_TARGET_WIDTH_M = 0.45
-DUEL_TARGET_HEIGHT_M = 0.80
-DUEL_RECOIL_RECOVERY_TAU = 0.17
-DUEL_BASE_AIM_SIGMA_DEG = 0.20
-DUEL_VERTICAL_RECOIL_SCALE = 0.38
-DUEL_HORIZONTAL_RECOIL_SCALE = 0.90
-
-# vertical은 1발당 수직 반동 계열, direction_var는 반동 방향 변화/수평 불안정성 계열로 쓰는 값이다.
-# 값이 없는 총기는 타입별 기본값을 사용한다. 추후 정확한 Sym.gg 수치를 확인하면 여기만 교체하면 된다.
-DUEL_RECOIL_BY_TYPE = {
-    "Assault": {"vertical": 0.78, "direction_var": 40.0},
-    "Carbine": {"vertical": 0.82, "direction_var": 38.0},
-    "SMG": {"vertical": 0.70, "direction_var": 45.0},
-    "LMG": {"vertical": 0.90, "direction_var": 36.0},
-    "Sidearm": {"vertical": 0.95, "direction_var": 34.0},
-}
-
-DUEL_RECOIL_DATA = {
-    # Assault
-    "M433": {"vertical": 0.78, "direction_var": 48.4},
-    "B36A4": {"vertical": 0.67, "direction_var": 40.0},
-    "SOR-556 MK2": {"vertical": 0.58, "direction_var": 25.0},
-    "AK4D": {"vertical": 0.68, "direction_var": 28.0},
-    "TR-7": {"vertical": 1.04, "direction_var": 45.2},
-    "KORD 6P67": {"vertical": 0.92, "direction_var": 46.0},
-    "NVO-228E": {"vertical": 0.95, "direction_var": 44.0},
-    "L85A3": {"vertical": 0.63, "direction_var": 31.6},
-    "VCR-2": {"vertical": 0.88, "direction_var": 45.0},
-    "M16A4 *": {"vertical": 0.70, "direction_var": 30.0},
-
-    # Carbine
-    "M4A1": {"vertical": 0.88, "direction_var": 42.0},
-    "M277": {"vertical": 0.96, "direction_var": 38.7},
-    "AK-205": {"vertical": 0.58, "direction_var": 26.0},
-    "M417 A2": {"vertical": 0.60, "direction_var": 26.0},
-    "GRT-BC": {"vertical": 0.72, "direction_var": 34.0},
-    "QBZ-192": {"vertical": 0.56, "direction_var": 24.0},
-    "SG 553R": {"vertical": 0.95, "direction_var": 43.0},
-    "SOR-300SC": {"vertical": 0.90, "direction_var": 40.0},
-
-    # SMG
-    "SGX": {"vertical": 0.68, "direction_var": 44.0},
-    "PW5A3": {"vertical": 0.62, "direction_var": 40.0},
-    "PW7A2": {"vertical": 0.70, "direction_var": 46.0},
-    "UMG-40": {"vertical": 0.58, "direction_var": 36.0},
-    "USG-90": {"vertical": 0.64, "direction_var": 39.0},
-    "KV9": {"vertical": 0.76, "direction_var": 48.0},
-    "SCW-10": {"vertical": 0.72, "direction_var": 45.0},
-    "SL9": {"vertical": 0.55, "direction_var": 34.0},
-    "CZ3A1": {"vertical": 0.82, "direction_var": 50.0},
-
-    # LMG
-    "L110": {"vertical": 0.82, "direction_var": 35.0},
-    "DRS-IAR": {"vertical": 0.76, "direction_var": 34.0},
-    "M/60": {"vertical": 0.95, "direction_var": 34.0},
-    "RPKM": {"vertical": 0.85, "direction_var": 32.0},
-    "M123K": {"vertical": 0.88, "direction_var": 36.0},
-    "M250": {"vertical": 0.90, "direction_var": 38.0},
-    "KTS100 MK8": {"vertical": 0.84, "direction_var": 33.0},
-    "M240L": {"vertical": 1.02, "direction_var": 37.0},
-    "M121 A2": {"vertical": 0.86, "direction_var": 35.0},
-    "RPK-74M *": {"vertical": 0.74, "direction_var": 30.0},
-
-    # Sidearm
-    "P18": {"vertical": 0.82, "direction_var": 32.0},
-    "ES 5.7": {"vertical": 0.58, "direction_var": 24.0},
-    "M45A1": {"vertical": 0.72, "direction_var": 28.0},
-    "M44": {"vertical": 1.15, "direction_var": 28.0},
-    "GGH-22": {"vertical": 0.64, "direction_var": 24.0},
-    "M357 TRAIT": {"vertical": 1.05, "direction_var": 30.0},
-    "VZ. 61": {"vertical": 0.78, "direction_var": 42.0},
-}
-
-# Update 1.3.3.0 공식 Recoil Variation 값. 기존 vertical 값은 유지하고 방향 편차만 교체한다.
-PATCH_133_RECOIL_VARIATION = {
-    "TR-7": 40.8,
-    "AK4D": 20.0,
-    "NVO-228E": 28.9,
-    "VCR-2": 50.3,
-    "M433": 41.4,
-    "M16A4 *": 37.5,
-    "B36A4": 28.0,
-    "L85A3": 22.8,
-    "SOR-556 MK2": 12.7,
-    "KORD 6P67": 28.9,
-    "M417 A2": 15.4,
-    "SG 553R": 35.8,
-    "SOR-300SC": 15.8,
-    "M277": 34.4,
-    "M4A1": 30.7,
-    "GRT-BC": 26.1,
-    "QBZ-192": 19.9,
-    "AK-205": 7.4,
-    "RPKM": 17.5,
-    "DRS-IAR": 29.3,
-    "KTS100 MK8": 9.5,
-    "RPK-74M *": 16.1,
-    "M121 A2": 31.8,
-    "M240L": 34.5,
-    "M/60": 29.9,
-    "M250": 35.9,
-    "M123K": 47.7,
-    "L110": 31.0,
-    "SCW-10": 33.5,
-    "UMG-40": 13.0,
-    "KV9": 50.0,
-    "CZ3A1": 50.8,
-    "SGX": 31.7,
-    "PW5A3": 28.3,
-    "SL9": 13.0,
-    "USG-90": 35.5,
-    "PW7A2": 27.8,
-    "VZ. 61": 18.4,
-}
-
-for _weapon_name, _direction_var in PATCH_133_RECOIL_VARIATION.items():
-    if _weapon_name in DUEL_RECOIL_DATA:
-        DUEL_RECOIL_DATA[_weapon_name]["direction_var"] = _direction_var
-
-
-def duel_recoil_for_weapon(weapon: Dict) -> Dict[str, float]:
-    """1:1 비교용 반동 데이터를 반환한다. 없으면 타입별 기본값을 쓴다."""
-    weapon_name = str(weapon.get("weapon", ""))
-    weapon_type = str(weapon.get("type", ""))
-    if weapon_name in DUEL_RECOIL_DATA:
-        return DUEL_RECOIL_DATA[weapon_name]
-    return DUEL_RECOIL_BY_TYPE.get(weapon_type, {"vertical": 0.80, "direction_var": 40.0})
-
-
-def duel_burst_len_for_distance(distance: float) -> int:
-    """거리별 반동 리셋 단위. 15m 이하는 명중률 고정이라 실질적으로 영향이 없다."""
-    if distance <= 15:
-        return 999999
-    if distance <= 40:
-        return 10
-    return 8
-
-
-def duel_target_half_angles(distance: float) -> tuple[float, float]:
-    """표적이 차지하는 좌우/상하 반각을 라디안으로 반환한다."""
-    d = max(float(distance), 0.1)
-    theta_x = math.atan((DUEL_TARGET_WIDTH_M / 2.0) / d)
-    theta_y = math.atan((DUEL_TARGET_HEIGHT_M / 2.0) / d)
-    return theta_x, theta_y
-
-
-def duel_recoil_sigma_radians(weapon: Dict, shot_in_pattern: int) -> tuple[float, float]:
-    """해당 탄 번호에서 좌우/상하 조준 오차 표준편차를 라디안으로 추정한다."""
-    recoil = duel_recoil_for_weapon(weapon)
-    rpm = max(float(weapon.get("rpm", 600.0)), 1.0)
-    shot_interval = 60.0 / rpm
-    rho = math.exp(-shot_interval / DUEL_RECOIL_RECOVERY_TAU)
-
-    n = max(int(shot_in_pattern), 1)
-    if n <= 1:
-        accumulated = 0.0
-    else:
-        denominator = max(1e-9, 1.0 - rho ** 2)
-        accumulated = (1.0 - rho ** (2 * (n - 1))) / denominator
-
-    vertical = float(recoil.get("vertical", 0.8))
-    direction_var = float(recoil.get("direction_var", 40.0))
-    horizontal_component = vertical * math.sin(math.radians(max(direction_var, 0.0) / 2.0))
-
-    base_sigma = math.radians(DUEL_BASE_AIM_SIGMA_DEG)
-    sigma_x = math.sqrt(
-        base_sigma ** 2
-        + (math.radians(horizontal_component * DUEL_HORIZONTAL_RECOIL_SCALE) ** 2) * accumulated
-    )
-    sigma_y = math.sqrt(
-        base_sigma ** 2
-        + (math.radians(vertical * DUEL_VERTICAL_RECOIL_SCALE) ** 2) * accumulated
-    )
-
-    return max(sigma_x, 1e-9), max(sigma_y, 1e-9)
-
-
-def duel_geometry_hit_probability_raw(weapon: Dict, distance: float, shot_in_pattern: int) -> float:
-    """
-    표적 허용각과 n번째 탄의 반동 오차를 비교해 원시 명중 확률 G(n,d)를 계산한다.
-    이 값 자체는 실제 개인 명중률이 아니라, 15m 대비 감쇠율을 만들기 위한 기하학 값이다.
-    """
-    theta_x, theta_y = duel_target_half_angles(distance)
-    sigma_x, sigma_y = duel_recoil_sigma_radians(weapon, shot_in_pattern)
-
-    px = math.erf(theta_x / (math.sqrt(2.0) * sigma_x))
-    py = math.erf(theta_y / (math.sqrt(2.0) * sigma_y))
-    return max(1e-9, min(1.0, px * py))
-
-
-def duel_hit_probability_for_shot(weapon: Dict, distance: float, fired_shot_number: int) -> float:
-    """
-    15m까지는 모든 총기 25% 명중률로 고정한다.
-    15m 이후에는 G(n,d) / G(n,15m) 비율만큼 명중률을 감쇠시킨다.
-    """
-    if distance <= 15:
-        return DUEL_BASE_ACCURACY_UNTIL_15M
-
-    burst_len = duel_burst_len_for_distance(distance)
-    shot_in_pattern = ((int(fired_shot_number) - 1) % burst_len) + 1
-
-    g_distance = duel_geometry_hit_probability_raw(weapon, distance, shot_in_pattern)
-    g_15m = duel_geometry_hit_probability_raw(weapon, 15.0, shot_in_pattern)
-    decay = min(1.0, max(0.0, g_distance / max(g_15m, 1e-9)))
-
-    return max(0.001, min(DUEL_BASE_ACCURACY_UNTIL_15M, DUEL_BASE_ACCURACY_UNTIL_15M * decay))
-
-
-def duel_variable_accuracy_distribution(
-    weapon: Dict,
-    distance: float,
-    armor_plates: int,
-    hit_zone: str = "chest",
-    cdf_cutoff: float = 0.999,
-    max_shots: int = 500,
-) -> pd.DataFrame:
-    """
-    탄마다 명중률이 달라지는 경우의 킬 시간 분포.
-    상태 DP:
-    - 아직 처치 전인 상태에서 현재까지 h발 명중했을 확률
-    - 다음 탄 p_n으로 명중/빗나감 분기
-    """
-    base_row = weapon_result_row(
-        weapon=weapon,
-        distance=float(distance),
-        armor_plates=int(armor_plates),
-        hit_zone=hit_zone,
-    )
-    stk = int(base_row["shots_to_kill"])
-    rpm = max(float(base_row["rpm"]), 1.0)
-    interval = 60.0 / rpm
-
-    state = [0.0] * stk
-    state[0] = 1.0
-    rows = []
-    cumulative = 0.0
-
-    for shot in range(1, max_shots + 1):
-        p = duel_hit_probability_for_shot(weapon, distance, shot)
-        next_state = [0.0] * stk
-        kill_probability = 0.0
-
-        for hits, probability in enumerate(state):
-            if probability <= 0:
-                continue
-
-            # miss
-            next_state[hits] += probability * (1.0 - p)
-
-            # hit
-            if hits + 1 >= stk:
-                kill_probability += probability * p
-            else:
-                next_state[hits + 1] += probability * p
-
-        if kill_probability > 0:
-            cumulative += kill_probability
-            rows.append({
-                "weapon": weapon.get("weapon", ""),
-                "fired_shots": shot,
-                "kill_time_sec": (shot - 1) * interval,
-                "probability": kill_probability,
-                "cumulative_probability": min(cumulative, 1.0),
-                "shot_hit_probability": p,
-                "stk": stk,
-                "rpm": rpm,
-            })
-
-        state = next_state
-
-        if cumulative >= cdf_cutoff:
-            break
-
-        if sum(state) < 1e-9:
-            break
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    total = float(df["probability"].sum())
-    if total > 0:
-        df["probability"] = df["probability"] / total
-        df["cumulative_probability"] = df["probability"].cumsum().clip(upper=1.0)
-        df["probability_percent"] = df["probability"] * 100.0
-        df["cumulative_percent"] = df["cumulative_probability"] * 100.0
-
-    return df
-
-
-def duel_distribution_mean_sigma(df: pd.DataFrame) -> tuple[float | None, float | None]:
-    if df.empty:
-        return None, None
-    times = df["kill_time_sec"].astype(float)
-    probs = df["probability"].astype(float)
-    mean = float((times * probs).sum())
-    variance = float(((times - mean) ** 2 * probs).sum())
-    return mean, math.sqrt(max(0.0, variance))
-
-
-def duel_distribution_quantile(df: pd.DataFrame, q: float) -> float | None:
-    if df.empty:
-        return None
-    hit = df[df["cumulative_probability"] >= q]
-    if hit.empty:
-        return None
-    return float(hit.iloc[0]["kill_time_sec"])
-
-
-def duel_win_probability(df_a: pd.DataFrame, df_b: pd.DataFrame) -> tuple[float, float, float]:
-    """
-    A/B 킬 시간 분포로 A 승률, B 승률, 동시킬 확률을 계산한다.
-    같은 시간은 0.5승으로 처리할 수 있도록 tie를 별도 반환한다.
-    """
-    if df_a.empty or df_b.empty:
-        return 0.0, 0.0, 0.0
-
-    a_times = df_a["kill_time_sec"].to_numpy(dtype=float)
-    a_probs = df_a["probability"].to_numpy(dtype=float)
-    b_times = df_b["kill_time_sec"].to_numpy(dtype=float)
-    b_probs = df_b["probability"].to_numpy(dtype=float)
-
-    eps = 1e-9
-    a_win_raw = 0.0
-    tie = 0.0
-
-    for t, p_a in zip(a_times, a_probs):
-        b_after = b_probs[b_times > t + eps].sum()
-        b_equal = b_probs[abs(b_times - t) <= eps].sum()
-        a_win_raw += p_a * b_after
-        tie += p_a * b_equal
-
-    b_win_raw = max(0.0, 1.0 - a_win_raw - tie)
-    a_score = a_win_raw + 0.5 * tie
-    b_score = b_win_raw + 0.5 * tie
-
-    return float(a_score), float(b_score), float(tie)
-
-
-def duel_distance_sweep_win_probability(
-    weapon_a: Dict,
-    weapon_b: Dict,
-    armor_plates: int,
-    hit_zone: str = "chest",
-    min_distance: int = 15,
-    max_distance: int = 100,
-    step: int = 1,
-) -> pd.DataFrame:
-    """
-    15m부터 최대 거리까지 모든 거리에서 A/B 승률을 계산한다.
-    슬라이더 값과 무관하게 같은 두 총기/방탄판 조건에서는 동일한 곡선이 나오고,
-    화면에서는 현재 선택 거리만 수직선으로 표시한다.
-    """
-    rows = []
-
-    for distance_value in range(int(min_distance), int(max_distance) + 1, int(step)):
-        df_a = duel_variable_accuracy_distribution(
-            weapon_a,
-            distance=float(distance_value),
-            armor_plates=int(armor_plates),
-            hit_zone=hit_zone,
-        )
-        df_b = duel_variable_accuracy_distribution(
-            weapon_b,
-            distance=float(distance_value),
-            armor_plates=int(armor_plates),
-            hit_zone=hit_zone,
-        )
-
-        a_win, b_win, tie_probability = duel_win_probability(df_a, df_b)
-
-        rows.append({
-            "distance": distance_value,
-            "a_weapon": weapon_a.get("weapon", ""),
-            "b_weapon": weapon_b.get("weapon", ""),
-            "a_win_percent": a_win * 100.0,
-            "b_win_percent": b_win * 100.0,
-            "tie_percent": tie_probability * 100.0,
-            "winner": weapon_a.get("weapon", "") if a_win >= b_win else weapon_b.get("weapon", ""),
-        })
-
-    return pd.DataFrame(rows)
-
-
-# =========================
+    frame = pd.DataFrame(rows)
+    frame = frame.sort_values(
+        ["ttk_mean_s", "practical_stk_mean", "weapon"],
+        ascending=[True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    frame.insert(0, "rank", np.arange(1, len(frame) + 1))
+    return frame
+
+
+# ============================================================
 # Streamlit UI
-# =========================
+# ============================================================
 
-st.set_page_config(
-    page_title="Battlefield 6 TTK Calculator",
-    layout="wide",
-)
+def _format_results(results: pd.DataFrame) -> pd.DataFrame:
+    output = results.copy()
+    output["practical_stk_mean"] = output["practical_stk_mean"].round(3)
+    output["practical_stk_median"] = output["practical_stk_median"].round(0).astype("Int64")
+    output["practical_stk_p80"] = output["practical_stk_p80"].round(0).astype("Int64")
+    output["ttk_mean_s"] = output["ttk_mean_s"].round(4)
+    output["ttk_median_s"] = output["ttk_median_s"].round(4)
+    output["ttk_p80_s"] = output["ttk_p80_s"].round(4)
+    output["accuracy"] = (output["accuracy"] * 100.0).round(2)
+    output["kill_probability"] = (output["kill_probability"] * 100.0).round(3)
 
-st.title("Battlefield 6 총기 TTK 계산기")
-st.caption(
-    f"Update {PATCH_VERSION} 반영: 방탄판/신체 피해 배율, 공식 반동 방향 편차, 총구속도 보정. "
-    "거리별 기본 데미지 프로필은 기존 내장 데이터를 사용하며, 탄속과 Bullet Drag는 TTK 산식에 포함하지 않습니다."
-)
-
-# 타입 순서는 원본 데이터 등장 순서를 유지한다.
-type_order = []
-for weapon in WEAPON_DATA:
-    if weapon["type"] not in type_order:
-        type_order.append(weapon["type"])
-
-# 검색창은 타입 필터와 무관하게 전체 무기를 대상으로 한다.
-all_weapons_sorted = []
-for type_name in type_order:
-    weapons_in_type = [w for w in WEAPON_DATA if w["type"] == type_name]
-    weapons_in_type = sorted(weapons_in_type, key=lambda w: w["weapon"], reverse=True)
-    all_weapons_sorted.extend(weapons_in_type)
-
-all_weapon_options = [f'{w["type"]} | {w["weapon"]}' for w in all_weapons_sorted]
-all_weapon_option_map = {f'{w["type"]} | {w["weapon"]}': w for w in all_weapons_sorted}
-
-searched_weapon_options = st.sidebar.multiselect(
-    "총기명 검색 추가",
-    all_weapon_options,
-    default=[],
-    placeholder="총기 이름을 입력하세요",
-    help="키보드로 총기명을 입력하면 자동완성 목록에서 바로 추가할 수 있습니다. 타입 필터와 무관하게 전체 무기에서 검색합니다.",
-)
-
-st.sidebar.subheader("필터")
-selected_types = st.sidebar.multiselect(
-    "무기 타입 필터",
-    type_order,
-    default=[],
-    placeholder="선택하지 않으면 전체 표시",
-)
-
-# 비교할 총기 목록은 타입별로 묶고, 각 타입 안에서는 무기명을 내림차순으로 정렬한다.
-# 무기 타입을 아무것도 선택하지 않은 초기 상태에서는 "필터 없음"으로 보고 전체 무기를 보여준다.
-active_types = selected_types if selected_types else type_order
-
-filtered_weapons = []
-for type_name in type_order:
-    if type_name not in active_types:
-        continue
-    weapons_in_type = [w for w in WEAPON_DATA if w["type"] == type_name]
-    weapons_in_type = sorted(weapons_in_type, key=lambda w: w["weapon"], reverse=True)
-    filtered_weapons.extend(weapons_in_type)
-
-weapon_options = [f'{w["type"]} | {w["weapon"]}' for w in filtered_weapons]
-weapon_option_map = {f'{w["type"]} | {w["weapon"]}': w for w in filtered_weapons}
-
-def unique_labels_preserve_order(labels: List[str]) -> List[str]:
-    seen = set()
-    result = []
-    for label in labels:
-        if label in seen:
-            continue
-        seen.add(label)
-        result.append(label)
-    return result
-
-
-st.sidebar.subheader("계산 옵션")
-armor_plates = st.sidebar.radio(
-    "방탄 플레이트",
-    [0, 1, 2],
-    index=0,
-    horizontal=True,
-)
-
-hit_zone_label = st.sidebar.radio(
-    "피격 부위",
-    ["가슴", "복부·팔다리"],
-    index=0,
-    horizontal=True,
-    help="머리 배율은 탄약 종류에 따라 달라 현재 버전에서는 제외했습니다.",
-)
-hit_zone = "chest" if hit_zone_label == "가슴" else "lower_body"
-
-# 슬라이더와 +/- number_input을 동기화한다.
-if "distance_value" not in st.session_state:
-    st.session_state.distance_value = 15
-if "distance_slider" not in st.session_state:
-    st.session_state.distance_slider = st.session_state.distance_value
-if "distance_number" not in st.session_state:
-    st.session_state.distance_number = st.session_state.distance_value
-
-if "max_graph_distance_value" not in st.session_state:
-    st.session_state.max_graph_distance_value = 80
-if "max_graph_distance_slider" not in st.session_state:
-    st.session_state.max_graph_distance_slider = st.session_state.max_graph_distance_value
-if "max_graph_distance_number" not in st.session_state:
-    st.session_state.max_graph_distance_number = st.session_state.max_graph_distance_value
-
-
-def sync_distance_from_slider():
-    st.session_state.distance_value = st.session_state.distance_slider
-    st.session_state.distance_number = st.session_state.distance_slider
-
-
-def sync_distance_from_number():
-    st.session_state.distance_value = st.session_state.distance_number
-    st.session_state.distance_slider = st.session_state.distance_number
-
-
-def sync_max_graph_distance_from_slider():
-    st.session_state.max_graph_distance_value = st.session_state.max_graph_distance_slider
-    st.session_state.max_graph_distance_number = st.session_state.max_graph_distance_slider
-
-
-def sync_max_graph_distance_from_number():
-    st.session_state.max_graph_distance_value = st.session_state.max_graph_distance_number
-    st.session_state.max_graph_distance_slider = st.session_state.max_graph_distance_number
-
-
-st.sidebar.slider(
-    "비교 거리",
-    min_value=0,
-    max_value=150,
-    step=1,
-    key="distance_slider",
-    on_change=sync_distance_from_slider,
-)
-
-st.sidebar.number_input(
-    "비교 거리 +/-",
-    min_value=0,
-    max_value=150,
-    step=1,
-    key="distance_number",
-    on_change=sync_distance_from_number,
-)
-
-distance = int(st.session_state.distance_value)
-
-st.sidebar.slider(
-    "그래프 최대 거리",
-    min_value=30,
-    max_value=200,
-    step=1,
-    key="max_graph_distance_slider",
-    on_change=sync_max_graph_distance_from_slider,
-)
-
-st.sidebar.number_input(
-    "그래프 최대 거리 +/-",
-    min_value=30,
-    max_value=200,
-    step=1,
-    key="max_graph_distance_number",
-    on_change=sync_max_graph_distance_from_number,
-)
-
-max_graph_distance = int(st.session_state.max_graph_distance_value)
-
-selected_weapon_options = st.sidebar.multiselect(
-    "비교할 총기",
-    weapon_options,
-    default=[],
-    placeholder="타입 필터에서 고를 총기를 선택하세요",
-)
-
-selected_weapon_labels = unique_labels_preserve_order(
-    selected_weapon_options + searched_weapon_options
-)
-
-# =========================
-# 반동 기반 1:1 승률 비교
-# =========================
-
-st.subheader("반동 기반 1:1 승률 비교")
-st.caption(
-    "15m까지는 두 총기 모두 기본 명중률 25%로 고정하고, 15m 이후부터는 반동과 거리로 계산한 "
-    "기하학적 감쇠율을 적용합니다. 방탄판과 피격 부위 설정은 왼쪽 사이드바의 값을 사용합니다. "
-    "1.3.3.0의 공식 반동 방향 편차는 반영했지만, 총기별 세부 탄퍼짐 수치는 공개되지 않아 탄퍼짐 증가는 직접 계산하지 않습니다."
-)
-
-duel_weapon_options = [
-    label
-    for label, weapon in all_weapon_option_map.items()
-    if weapon.get("type") in DUEL_ELIGIBLE_TYPES
-]
-
-if "duel_distance_value" not in st.session_state:
-    st.session_state.duel_distance_value = 15
-
-# 기존 세션 또는 이전 버전에서 15m 미만 값이 남아 있어도,
-# 위젯을 만들기 전에 먼저 보정해야 Streamlit 세션 오류가 나지 않는다.
-st.session_state.duel_distance_value = max(15, int(st.session_state.duel_distance_value))
-
-if "duel_distance_slider" not in st.session_state:
-    st.session_state.duel_distance_slider = st.session_state.duel_distance_value
-else:
-    st.session_state.duel_distance_slider = max(15, int(st.session_state.duel_distance_slider))
-
-if "duel_distance_number" not in st.session_state:
-    st.session_state.duel_distance_number = st.session_state.duel_distance_value
-else:
-    st.session_state.duel_distance_number = max(15, int(st.session_state.duel_distance_number))
-
-# 세 값이 서로 어긋나 있으면 위젯 생성 전에 같은 값으로 맞춘다.
-st.session_state.duel_distance_value = max(
-    15,
-    int(st.session_state.duel_distance_value),
-)
-st.session_state.duel_distance_slider = st.session_state.duel_distance_value
-st.session_state.duel_distance_number = st.session_state.duel_distance_value
-
-
-def sync_duel_distance_from_slider():
-    st.session_state.duel_distance_value = st.session_state.duel_distance_slider
-    st.session_state.duel_distance_number = st.session_state.duel_distance_slider
-
-
-def sync_duel_distance_from_number():
-    st.session_state.duel_distance_value = st.session_state.duel_distance_number
-    st.session_state.duel_distance_slider = st.session_state.duel_distance_number
-
-
-duel_cols = st.columns([2.0, 2.0, 2.2, 1.25])
-with duel_cols[0]:
-    duel_a_label = st.selectbox(
-        "A 총기",
-        ["선택 안 함"] + duel_weapon_options,
-        index=0,
-        key="duel_weapon_a",
-    )
-with duel_cols[1]:
-    duel_b_label = st.selectbox(
-        "B 총기",
-        ["선택 안 함"] + duel_weapon_options,
-        index=0,
-        key="duel_weapon_b",
-    )
-with duel_cols[2]:
-    st.slider(
-        "교전 거리",
-        min_value=15,
-        max_value=100,
-        step=1,
-        key="duel_distance_slider",
-        on_change=sync_duel_distance_from_slider,
-    )
-with duel_cols[3]:
-    st.number_input(
-        "거리 +/-",
-        min_value=15,
-        max_value=100,
-        step=1,
-        key="duel_distance_number",
-        on_change=sync_duel_distance_from_number,
+    return output.rename(
+        columns={
+            "rank": "순위",
+            "class": "종류",
+            "weapon": "총기",
+            "rpm": "RPM",
+            "vertical_recoil_control_percent": "수직 반동 제어 (%)",
+            "practical_stk_mean": "실전 STK 평균",
+            "practical_stk_median": "실전 STK 중앙값",
+            "practical_stk_p80": "실전 STK P80",
+            "ttk_mean_s": "TTK 평균 (초)",
+            "ttk_median_s": "TTK 중앙값 (초)",
+            "ttk_p80_s": "TTK P80 (초)",
+            "accuracy": "명중률 (%)",
+            "kill_probability": "처치 성공률 (%)",
+            "first_low_accuracy_shot": "첫 20% 이하 발차",
+            "low_accuracy_shot_count": "20% 이하 발차 수",
+            "trials": "시행 횟수",
+        }
     )
 
-duel_distance = int(st.session_state.duel_distance_value)
 
-if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
-    if duel_a_label == duel_b_label:
-        st.warning("서로 다른 두 총기를 선택하세요.")
-    else:
-        duel_weapon_a = all_weapon_option_map[duel_a_label]
-        duel_weapon_b = all_weapon_option_map[duel_b_label]
+def render_app() -> None:
+    if st is None:
+        raise RuntimeError("Streamlit is not installed")
 
-        duel_df_a = duel_variable_accuracy_distribution(
-            duel_weapon_a,
-            distance=float(duel_distance),
-            armor_plates=int(armor_plates),
-            hit_zone=hit_zone,
+    st.set_page_config(page_title="BF6 Practical STK / TTK", layout="wide")
+    st.title("Battlefield 6 실전 STK / TTK")
+    st.caption(
+        f"BUILD {BUILD_ID} · {MODEL_VERSION} · 총기당 {TRIALS_PER_WEAPON:,}회 고정"
+    )
+
+    control_col, distance_col = st.columns([1.0, 2.0])
+    with control_col:
+        vertical_recoil_control_percent = st.radio(
+            "수직 반동 제어",
+            options=list(VERTICAL_RECOIL_CONTROL_OPTIONS),
+            index=0,
+            horizontal=True,
+            format_func=lambda value: f"{value}%",
+            help=(
+                "각 발의 수직 반동 성분만 선택한 비율만큼 상쇄합니다. "
+                "수평 반동과 스프레드는 바뀌지 않습니다."
+            ),
         )
-        duel_df_b = duel_variable_accuracy_distribution(
-            duel_weapon_b,
-            distance=float(duel_distance),
-            armor_plates=int(armor_plates),
-            hit_zone=hit_zone,
+    with distance_col:
+        distance_m = st.slider(
+            "거리 (m)", min_value=1, max_value=150, value=30, step=1
         )
 
-        a_win, b_win, tie_probability = duel_win_probability(duel_df_a, duel_df_b)
-
-        mean_a, sigma_a = duel_distribution_mean_sigma(duel_df_a)
-        mean_b, sigma_b = duel_distribution_mean_sigma(duel_df_b)
-
-        p80_a = duel_distribution_quantile(duel_df_a, 0.80)
-        p80_b = duel_distribution_quantile(duel_df_b, 0.80)
-        p95_a = duel_distribution_quantile(duel_df_a, 0.95)
-        p95_b = duel_distribution_quantile(duel_df_b, 0.95)
-
-        base_a = weapon_result_row(duel_weapon_a, float(duel_distance), int(armor_plates), hit_zone=hit_zone)
-        base_b = weapon_result_row(duel_weapon_b, float(duel_distance), int(armor_plates), hit_zone=hit_zone)
-
-        p_a_first = duel_hit_probability_for_shot(duel_weapon_a, float(duel_distance), 1) * 100.0
-        p_b_first = duel_hit_probability_for_shot(duel_weapon_b, float(duel_distance), 1) * 100.0
-        burst_a = duel_burst_len_for_distance(float(duel_distance))
-        burst_b = duel_burst_len_for_distance(float(duel_distance))
-        p_a_late = duel_hit_probability_for_shot(duel_weapon_a, float(duel_distance), min(8, burst_a)) * 100.0
-        p_b_late = duel_hit_probability_for_shot(duel_weapon_b, float(duel_distance), min(8, burst_b)) * 100.0
-
-        winner = duel_weapon_a["weapon"] if a_win >= b_win else duel_weapon_b["weapon"]
-        winner_prob = max(a_win, b_win) * 100.0
-
-        metric_cols = st.columns(3)
-        metric_cols[0].metric("예상 우세 총기", winner)
-        metric_cols[1].metric(f"{duel_weapon_a['weapon']} 승률", f"{a_win * 100:.1f}%")
-        metric_cols[2].metric(f"{duel_weapon_b['weapon']} 승률", f"{b_win * 100:.1f}%")
-
-        result_df = pd.DataFrame([
-            {
-                "총기": duel_weapon_a["weapon"],
-                "타입": duel_weapon_a["type"],
-                "승률": a_win * 100,
-                "STK": base_a["shots_to_kill"],
-                "완전명중 TTK sec": base_a["ttk_sec"],
-                "평균 처치 시간 sec": mean_a,
-                "표준편차 σ sec": sigma_a,
-                "P80 sec": p80_a,
-                "P95 sec": p95_a,
-                "1발째 명중률 %": p_a_first,
-                "8발째/패턴 명중률 %": p_a_late,
-            },
-            {
-                "총기": duel_weapon_b["weapon"],
-                "타입": duel_weapon_b["type"],
-                "승률": b_win * 100,
-                "STK": base_b["shots_to_kill"],
-                "완전명중 TTK sec": base_b["ttk_sec"],
-                "평균 처치 시간 sec": mean_b,
-                "표준편차 σ sec": sigma_b,
-                "P80 sec": p80_b,
-                "P95 sec": p95_b,
-                "1발째 명중률 %": p_b_first,
-                "8발째/패턴 명중률 %": p_b_late,
-            },
-        ])
-
-        for col in [
-            "승률",
-            "완전명중 TTK sec",
-            "평균 처치 시간 sec",
-            "표준편차 σ sec",
-            "P80 sec",
-            "P95 sec",
-            "1발째 명중률 %",
-            "8발째/패턴 명중률 %",
-        ]:
-            result_df[col] = result_df[col].round(3)
-
-        st.dataframe(result_df, use_container_width=True, hide_index=True)
-
-        duel_sweep_df = duel_distance_sweep_win_probability(
-            duel_weapon_a,
-            duel_weapon_b,
-            armor_plates=int(armor_plates),
-            hit_zone=hit_zone,
-            min_distance=15,
-            max_distance=100,
-            step=1,
-        )
-
-        if not duel_sweep_df.empty:
-            win_fig = go.Figure()
-
-            win_fig.add_trace(
-                go.Scatter(
-                    x=duel_sweep_df["distance"],
-                    y=duel_sweep_df["a_win_percent"],
-                    mode="lines",
-                    name=f"{duel_weapon_a['weapon']} 승률",
-                    line=dict(width=3),
-                    hovertemplate=
-                    "거리: %{x}m<br>"
-                    f"{duel_weapon_a['weapon']} 승률: " + "%{y:.1f}%"
-                    "<extra></extra>",
-                )
-            )
-
-            win_fig.add_trace(
-                go.Scatter(
-                    x=duel_sweep_df["distance"],
-                    y=duel_sweep_df["b_win_percent"],
-                    mode="lines",
-                    name=f"{duel_weapon_b['weapon']} 승률",
-                    line=dict(width=3),
-                    hovertemplate=
-                    "거리: %{x}m<br>"
-                    f"{duel_weapon_b['weapon']} 승률: " + "%{y:.1f}%"
-                    "<extra></extra>",
-                )
-            )
-
-            win_fig.add_hline(
-                y=50,
-                line_width=1,
-                line_dash="dash",
-                annotation_text="50%",
-                annotation_position="top left",
-            )
-
-            win_fig.add_vline(
-                x=duel_distance,
-                line_width=2,
-                line_dash="dot",
-                line_color="white",
-                annotation_text=f"현재 {duel_distance}m",
-                annotation_position="top",
-                annotation_font_color="white",
-            )
-
-            win_fig.update_layout(
-                title="거리별 승률 그래프",
-                xaxis_title="거리 m",
-                yaxis_title="승률 %",
-                yaxis=dict(range=[0, 100]),
-                xaxis=dict(range=[15, 100]),
-                legend_title="총기",
-            )
-
-            st.plotly_chart(win_fig, use_container_width=True)
-
-        with st.expander("1:1 비교 모델 설명"):
-            st.write(
-                """
-                - 15m 이하는 두 총기의 기본 명중률을 모두 25%로 고정합니다.
-                - Update 1.3.3.0의 공식 Recoil Variation 값을 적용했습니다.
-                - 총기별 정확한 Dispersion Growth 수치는 공개되지 않아 탄퍼짐 변화는 이 승률 모델에 포함하지 않았습니다.
-                - 15m를 넘으면 `G(n,d) / G(n,15m)` 감쇠율을 곱합니다.
-                - `G(n,d)`는 표적 너비/높이가 거리에서 차지하는 허용각과, n번째 탄의 반동 오차를 비교한 기하학 값입니다.
-                - 15~40m는 10발 단위, 40m 초과는 8발 단위로 반동 패턴이 리셋된다고 가정합니다.
-                - 승률은 두 총기의 킬 시간 분포를 직접 비교해 계산합니다. 같은 시간에 처치하는 경우는 0.5승으로 처리합니다.
-                - 거리별 승률 그래프는 15~100m 전체를 고정 계산하며, 슬라이더는 현재 확인 중인 거리의 수직선만 움직입니다.
-                """
-            )
-else:
-    st.info("A 총기와 B 총기를 선택하면 해당 거리에서의 승률 비교가 표시됩니다.")
-
-st.divider()
-
-if not selected_weapon_labels:
-    st.info("왼쪽 사이드바에서 비교할 총기를 직접 선택하거나, 총기명 검색으로 추가하세요.")
-    st.stop()
-
-selected_weapon_data = [
-    all_weapon_option_map[label]
-    for label in selected_weapon_labels
-    if label in all_weapon_option_map
-]
-weapon_by_name = {weapon["weapon"]: weapon for weapon in WEAPON_DATA}
-
-if not selected_weapon_data:
-    st.warning("비교할 총기가 선택되지 않았습니다.")
-    st.stop()
-
-if searched_weapon_options:
-    st.sidebar.caption("검색으로 추가한 총기는 무기 타입 필터와 관계없이 비교 대상에 포함됩니다.")
-
-summary_rows = [
-    weapon_result_row(
-        weapon=w,
-        distance=float(distance),
-        armor_plates=armor_plates,
-        hit_zone=hit_zone,
+    st.info(
+        "실전 STK는 빗나간 탄까지 포함해 처치까지 실제 발사한 총탄 수입니다. "
+        "선택한 수직 반동 제어율은 모든 총기에 동일하게 적용되며 수평 반동에는 적용되지 않습니다. "
+        "한 발차의 고정 코호트 명중률이 20% 이하가 되면 다음 발은 직전 발사 0.2초 후에 나갑니다. "
+        "같은 거리·같은 제어율에서 끝난 총기는 캐시에서 즉시 불러옵니다. "
+        "다른 제어율을 처음 선택하면 해당 조건을 새로 계산합니다."
     )
-    for w in selected_weapon_data
-]
-summary_df = pd.DataFrame(summary_rows)
-summary_df["ttk_ms"] = summary_df["ttk_sec"] * 1000
-summary_df = summary_df.sort_values(["ttk_sec", "shots_to_kill", "weapon"]).reset_index(drop=True)
 
-# =========================
-# 화면 출력
-# =========================
-
-left, right = st.columns([1.35, 1])
-
-with left:
-    st.subheader(f"{distance}m / {hit_zone_label} 기준 비교")
-
-    display_df = summary_df.copy()
-    for col in [
-        "ttk_sec",
-        "normal_damage_at_distance",
-        "armor_effective_distance",
-        "armor_damage_multiplier",
-        "armor_damage_at_effective_distance",
-        "reload",
-    ]:
-        if col in display_df.columns:
-            display_df[col] = display_df[col].round(3)
-
-    display_df = display_df[
-        [
-            "type",
-            "weapon",
-            "rpm",
-            "firing_mode",
-            "reload",
-            "hit_zone_label",
-            "normal_damage_at_distance",
-            "armor_effective_distance",
-            "armor_damage_multiplier",
-            "armor_damage_at_effective_distance",
-            "armor_plates",
-            "shots_to_kill",
-            "ttk_sec",
-        ]
-    ].rename(columns={
-        "type": "타입",
-        "weapon": "총기",
-        "rpm": "RPM",
-        "firing_mode": "발사모드",
-        "reload": "재장전",
-        "hit_zone_label": "피격 부위",
-        "normal_damage_at_distance": "일반 데미지",
-        "armor_effective_distance": "방탄판 판정 거리",
-        "armor_damage_multiplier": "방탄판 배율",
-        "armor_damage_at_effective_distance": "방탄판 적용 데미지",
-        "armor_plates": "방탄판",
-        "shots_to_kill": "STK",
-        "ttk_sec": "TTK",
-    })
-
-    st.dataframe(
-        display_df,
+    calculate = st.button(
+        f"37종 전체 × {TRIALS_PER_WEAPON:,}회 계산 · 수직 제어 {vertical_recoil_control_percent}%",
+        type="primary",
         use_container_width=True,
-        hide_index=True,
     )
 
-with right:
-    st.subheader("계산 규칙")
+    request_key = (
+        f"distance-{int(distance_m)}-vertical-control-"
+        f"{int(vertical_recoil_control_percent)}"
+    )
+    if calculate:
+        st.session_state["bf6_requested_key"] = request_key
 
-    if armor_plates == 0:
-        st.write(
-            f"""
-            **방탄판 0장 / {hit_zone_label} 피격**
-            - HP: 100
-            - 플레이트 없음
-            - 실제 거리 기준 데미지 적용
-            - 복부·팔다리 선택 시 자동화기 0.84x, DMR 0.91x 적용
-            """
+    if st.session_state.get("bf6_requested_key") != request_key:
+        st.warning("거리를 정한 뒤 계산 버튼을 누르세요.")
+        return
+
+    progress = st.progress(0.0, text="계산 준비 중…")
+    status = st.empty()
+    rows: list[dict[str, Any]] = []
+    for index, weapon in enumerate(WEAPON_DATA, start=1):
+        status.write(
+            f"{index}/{len(WEAPON_DATA)} — {weapon['class']} | {weapon['weapon']} "
+            f"({TRIALS_PER_WEAPON:,}회)"
         )
+        rows.append(
+            simulate_weapon(
+                weapon_id=weapon["id"],
+                distance_m=int(distance_m),
+                trials=TRIALS_PER_WEAPON,
+                vertical_recoil_control_percent=int(
+                    vertical_recoil_control_percent
+                ),
+            )
+        )
+        progress.progress(
+            index / len(WEAPON_DATA),
+            text=f"{index}/{len(WEAPON_DATA)} 완료",
+        )
+
+    progress.empty()
+    status.empty()
+    results = pd.DataFrame(rows).sort_values(
+        ["ttk_mean_s", "practical_stk_mean", "weapon"],
+        ascending=[True, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    results.insert(0, "rank", np.arange(1, len(results) + 1))
+
+    view = _format_results(results)
+    columns = [
+        "순위",
+        "종류",
+        "총기",
+        "RPM",
+        "수직 반동 제어 (%)",
+        "실전 STK 평균",
+        "실전 STK 중앙값",
+        "실전 STK P80",
+        "TTK 평균 (초)",
+        "TTK 중앙값 (초)",
+        "TTK P80 (초)",
+        "명중률 (%)",
+        "처치 성공률 (%)",
+        "첫 20% 이하 발차",
+        "시행 횟수",
+    ]
+
+    st.subheader(f"{int(distance_m)}m — 자동화기 37종")
+    st.dataframe(view[columns], use_container_width=True, hide_index=True)
+
+    csv_bytes = view[columns].to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "현재 결과 CSV 다운로드",
+        data=csv_bytes,
+        file_name=(
+            f"bf6_mc_{int(distance_m)}m_vcontrol-"
+            f"{int(vertical_recoil_control_percent)}pct_"
+            f"{TRIALS_PER_WEAPON}.csv"
+        ),
+        mime="text/csv",
+    )
+
+    with st.expander("계산 정의"):
+        st.write(
+            {
+                "시행 횟수": f"총기마다 정확히 {TRIALS_PER_WEAPON:,}회",
+                "수직 반동 제어": f"{vertical_recoil_control_percent}%",
+                "제어 적용 방식": (
+                    "매 발 새로 발생한 수직 반동 성분에만 적용; "
+                    "수평 반동·스프레드는 미변경"
+                ),
+                "조준점": f"가슴 중앙 y={AIM_POINT_Y_M}m",
+                "반동 방향": "평균 방향 ± Sym per-side variation",
+                "실전 STK": "빗나간 탄을 포함한 처치 발차",
+                "TTK": "첫 발 0초부터 치명탄 발사 시점까지; 재장전·0.2초 휴식 포함",
+                "명중률": "성공한 교전에서 처치까지 명중탄 / 발사탄",
+                "20% 규칙": "해당 발차 명중률 ≤20%이면 다음 발까지 총 간격 0.2초",
+                "탄속/비행시간": "TTK에 미포함",
+                "데미지 모델": MODEL_VERSION,
+            }
+        )
+
+
+def self_test() -> None:
+    # Small smoke tests only; the app itself always uses 262,144 trials.
+    results = [
+        simulate_weapon(
+            "m433",
+            distance_m=20,
+            trials=2_048,
+            vertical_recoil_control_percent=control,
+        )
+        for control in VERTICAL_RECOIL_CONTROL_OPTIONS
+    ]
+    result = results[0]
+    required = {
+        "practical_stk_mean",
+        "ttk_mean_s",
+        "accuracy",
+        "kill_probability",
+    }
+    missing = required - set(result)
+    if missing:
+        raise RuntimeError(f"self-test missing keys: {sorted(missing)}")
+    if not (0.0 <= float(result["kill_probability"]) <= 1.0):
+        raise RuntimeError("invalid kill probability")
+    for control, control_result in zip(VERTICAL_RECOIL_CONTROL_OPTIONS, results):
+        if int(control_result["vertical_recoil_control_percent"]) != control:
+            raise RuntimeError("vertical recoil control was not preserved")
+        if not (0.0 <= float(control_result["kill_probability"]) <= 1.0):
+            raise RuntimeError("invalid kill probability")
+    print("SELF-TEST OK")
+    print(json.dumps(results, ensure_ascii=False, indent=2, default=float))
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        self_test()
+    elif st is None:
+        print("Streamlit is not installed. Run: pip install streamlit numpy pandas")
     else:
-        st.write(
-            f"""
-            **방탄판 {armor_plates}장 / {hit_zone_label} 피격**
-            - HP: 100
-            - 플레이트 HP: {armor_plates * ARMOR_HP_PER_PLATE}
-            - 플레이트가 남아 있으면 해당 탄환은 **거리 +{ARMOR_RANGE_PENALTY:.0f}m 데미지** 적용
-            - 단, **DMR / Sidearm은 거리 +{ARMOR_RANGE_PENALTY:.0f}m 후퇴 미적용**
-            - 방탄판 피해 배율: 자동화기 **0.84x**, DMR **0.91x**, 저격소총 **0.67x**, Sidearm **1.0x**
-            - 플레이트 초과 피해는 HP로 넘어감
-            """
-        )
-
-    st.write(
-        f"""
-        **내장 데이터**
-        - 사용 가능 총기: {len(WEAPON_DATA)}개
-        - 제외된 항목: {len(SKIPPED_WEAPONS)}개
-        """
-    )
-
-# =========================
-# 거리별 TTK 그래프
-# =========================
-
-st.subheader("거리별 TTK 그래프")
-
-sweep_df = pd.concat(
-    [
-        sweep_weapon(
-            w,
-            armor_plates=armor_plates,
-            max_distance=max_graph_distance,
-            hit_zone=hit_zone,
-        )
-        for w in selected_weapon_data
-    ],
-    ignore_index=True,
-)
-sweep_df["ttk_ms"] = sweep_df["ttk_sec"] * 1000
-
-fig_ttk = px.line(
-    sweep_df,
-    x="distance",
-    y="ttk_ms",
-    color="weapon",
-    markers=False,
-    title="Distance / TTK",
-    labels={
-        "distance": "거리 m",
-        "ttk_ms": "TTK ms",
-        "weapon": "총기",
-        "shots_to_kill": "STK",
-        "type": "타입",
-    },
-    custom_data=["type", "shots_to_kill"],
-)
-
-fig_ttk.update_traces(
-    hovertemplate=
-    "타입: %{customdata[0]}<br>"
-    "총기: %{fullData.name}<br>"
-    "거리: %{x}m<br>"
-    "TTK: %{y:.1f} ms<br>"
-    "STK: %{customdata[1]}발"
-    "<extra></extra>"
-)
-
-st.plotly_chart(fig_ttk, use_container_width=True)
-
-# =========================
-# 개인 명중률 기반 평균 처치 시간
-# =========================
-
-st.subheader("개인 명중률 기반 평균 처치 시간")
-st.caption(
-    "기준: 현재 선택한 거리/방탄판 조건의 STK를 필요한 명중탄 수로 보고, "
-    "각 탄환이 입력한 명중률로 독립적으로 명중한다고 가정합니다. "
-    "재장전 시간은 반영하지 않습니다."
-)
-
-accuracy_cols = st.columns(min(3, len(selected_weapon_data)))
-accuracy_inputs = {}
-
-for idx, weapon in enumerate(selected_weapon_data):
-    weapon_name = weapon["weapon"]
-    with accuracy_cols[idx % len(accuracy_cols)]:
-        default_accuracy = default_accuracy_for_weapon(weapon)
-
-        accuracy_inputs[weapon_name] = st.number_input(
-            f"{weapon_name} 명중률 (%)",
-            min_value=0.1,
-            max_value=100.0,
-            value=round(float(default_accuracy), 2),
-            step=1.0,
-            format="%.2f",
-            key=f"accuracy_{weapon_name}",
-        )
-
-
-accuracy_rows = []
-for _, row in summary_df.iterrows():
-    weapon_name = row["weapon"]
-    weapon_obj = weapon_by_name.get(weapon_name)
-    accuracy = accuracy_inputs.get(weapon_name, 100.0)
-
-    stats = calculate_accuracy_stats(
-        shots_to_kill=int(row["shots_to_kill"]),
-        rpm=float(row["rpm"]),
-        accuracy_percent=float(accuracy),
-    )
-
-    mean_time_sec = stats["mean_time_sec"]
-    sigma_time_sec = stats["sigma_time_sec"]
-
-    accuracy_rows.append({
-        "type": row["type"],
-        "weapon": weapon_name,
-        "accuracy_percent": accuracy,
-        "stk_needed_hits": int(row["shots_to_kill"]),
-        "perfect_ttk_sec": row["ttk_sec"],
-        "mean_time_M_sec": mean_time_sec,
-        "sigma_sec": sigma_time_sec,
-        "expected_shots_fired": stats["expected_shots"],
-        "coverage": stats["coverage"],
-    })
-
-accuracy_df = pd.DataFrame(accuracy_rows)
-accuracy_df = accuracy_df.sort_values(["mean_time_M_sec", "weapon"]).reset_index(drop=True)
-
-accuracy_display = accuracy_df.copy()
-for col in [
-    "accuracy_percent",
-    "perfect_ttk_sec",
-    "mean_time_M_sec",
-    "sigma_sec",
-    "expected_shots_fired",
-    "coverage",
-]:
-    if col in accuracy_display.columns:
-        accuracy_display[col] = accuracy_display[col].round(3)
-
-accuracy_display = accuracy_display.rename(columns={
-    "type": "타입",
-    "weapon": "총기",
-    "accuracy_percent": "명중률 %",
-    "stk_needed_hits": "필요 명중탄 STK",
-    "perfect_ttk_sec": "완전명중 TTK s",
-    "mean_time_M_sec": "평균 처치 시간 sec",
-    "sigma_sec": "표준편차 σ sec",
-    "expected_shots_fired": "평균 발사탄 수",
-})
-
-accuracy_table_col, _accuracy_table_blank = st.columns([0.78, 0.22])
-with accuracy_table_col:
-    st.dataframe(
-        accuracy_display[
-            [
-                "타입",
-                "총기",
-                "명중률 %",
-                "필요 명중탄 STK",
-                "완전명중 TTK s",
-                "평균 처치 시간 sec",
-                "표준편차 σ sec",
-                "평균 발사탄 수",
-            ]
-        ],
-        use_container_width=False,
-        width=980,
-        hide_index=True,
-    )
-
-# 평균 처치 시간 막대그래프는 제거했습니다.
-# 아래의 음이항분포/누적확률 그래프에서 시간 분포를 직접 확인합니다.
-
-# =========================
-# 현재 거리 기준 개인 명중률 확률분포
-# =========================
-
-st.subheader("현재 거리 기준 개인 명중률 처치 시간 분포")
-st.caption(
-    "필요한 명중탄 수 STK와 개인 명중률을 바탕으로 한 음이항분포를 그립니다. "
-    "즉, '몇 발째에 킬이 나는가'를 확률로 보여줍니다. "
-    "곡선이 완전히 겹치는 총기도 구분되도록 총기마다 선 모양을 다르게 표시합니다."
-)
-
-weapon_order_for_accuracy_graph = [weapon["weapon"] for weapon in selected_weapon_data]
-sigma_color_map = color_map_by_sigma(accuracy_df, weapon_order_for_accuracy_graph)
-distribution_dash_map = line_dash_map_for_weapons(weapon_order_for_accuracy_graph)
-
-distribution_frames = []
-distribution_summary_rows = []
-
-for _, distribution_row in accuracy_df.iterrows():
-    distribution_weapon_name = distribution_row["weapon"]
-    distribution_df = negative_binomial_distribution(
-        shots_to_kill=int(distribution_row["stk_needed_hits"]),
-        rpm=float(weapon_by_name[distribution_weapon_name]["rpm"]),
-        accuracy_percent=float(distribution_row["accuracy_percent"]),
-    )
-
-    if distribution_df.empty:
-        continue
-
-    distribution_df = distribution_df.copy()
-    distribution_df["weapon"] = distribution_weapon_name
-    distribution_df["type"] = distribution_row["type"]
-    distribution_df["accuracy_percent"] = float(distribution_row["accuracy_percent"])
-    distribution_df["stk_needed_hits"] = int(distribution_row["stk_needed_hits"])
-    distribution_df["mean_time_M_sec"] = float(distribution_row["mean_time_M_sec"])
-    distribution_df["sigma_sec"] = float(distribution_row["sigma_sec"])
-    distribution_df["probability_percent"] = distribution_df["probability"] * 100.0
-    distribution_df["cumulative_percent"] = distribution_df["cumulative_probability"] * 100.0
-
-    q50 = distribution_quantile(distribution_df, 0.50)
-    q80 = distribution_quantile(distribution_df, 0.80)
-    q95 = distribution_quantile(distribution_df, 0.95)
-    coverage_percent = float(distribution_df["cumulative_probability"].iloc[-1]) * 100.0
-
-    distribution_summary_rows.append({
-        "타입": distribution_row["type"],
-        "총기": distribution_weapon_name,
-        "명중률 %": round(float(distribution_row["accuracy_percent"]), 2),
-        "필요 명중탄 STK": int(distribution_row["stk_needed_hits"]),
-        "평균 M sec": round(float(distribution_row["mean_time_M_sec"]), 3),
-        "표준편차 σ sec": round(float(distribution_row["sigma_sec"]), 3),
-        "50% 처치 시간 sec": round(q50, 3) if q50 is not None else None,
-        "80% 처치 시간 sec": round(q80, 3) if q80 is not None else None,
-        "95% 처치 시간 sec": round(q95, 3) if q95 is not None else None,
-        "표시 누적확률 %": round(coverage_percent, 2),
-        "색상 기준": "σ 높음 → 빨강" if distribution_weapon_name == max(sigma_color_map, key=lambda w: accuracy_df.loc[accuracy_df["weapon"] == w, "sigma_sec"].iloc[0]) else "",
-    })
-
-    distribution_frames.append(distribution_df)
-
-if not distribution_frames:
-    st.warning("선택한 총기의 개인 명중률 분포를 만들 수 없습니다.")
-else:
-    all_distribution_df = pd.concat(distribution_frames, ignore_index=True)
-
-    dist_summary_col, _dist_summary_blank = st.columns([0.86, 0.14])
-    with dist_summary_col:
-        st.dataframe(
-            pd.DataFrame(distribution_summary_rows).drop(columns=["색상 기준"], errors="ignore"),
-            use_container_width=False,
-            width=1080,
-            hide_index=True,
-        )
-
-    pmf_tab, cdf_tab = st.tabs(["확률분포", "누적확률"])
-
-    with pmf_tab:
-        fig_pmf = go.Figure()
-        for weapon_name in weapon_order_for_accuracy_graph:
-            weapon_df = all_distribution_df[all_distribution_df["weapon"] == weapon_name].sort_values("kill_time_sec")
-            if weapon_df.empty:
-                continue
-
-            color = sigma_color_map.get(weapon_name, "#666666")
-            dash_style = distribution_dash_map.get(weapon_name, "solid")
-            custom_data = weapon_df[[
-                "fired_shots",
-                "cumulative_percent",
-                "accuracy_percent",
-                "stk_needed_hits",
-                "mean_time_M_sec",
-                "sigma_sec",
-            ]].to_numpy()
-
-            fig_pmf.add_trace(
-                go.Scatter(
-                    x=weapon_df["kill_time_sec"],
-                    y=weapon_df["probability_percent"],
-                    mode="lines",
-                    line=dict(color=color, width=4, dash=dash_style),
-                    opacity=0.88,
-                    name=weapon_name,
-                    customdata=custom_data,
-                    hovertemplate=
-                        "총기: %{fullData.name}<br>"
-                        "처치 시간: %{x:.3f} sec<br>"
-                        "총 발사탄 수: %{customdata[0]}발<br>"
-                        "명중률: %{customdata[2]:.2f}%<br>"
-                        "필요 명중탄 STK: %{customdata[3]}발<br>"
-                        "해당 시점 처치 확률: %{y:.2f}%<br>"
-                        "누적 처치 확률: %{customdata[1]:.2f}%<br>"
-                        "평균 M: %{customdata[4]:.3f} sec<br>"
-                        "표준편차 σ: %{customdata[5]:.3f} sec"
-                        "<extra></extra>",
-                )
-            )
-
-        fig_pmf.update_layout(
-            title=f"처치 시간 확률분포 / 현재 거리 {distance}m",
-            xaxis_title="처치 시간 sec",
-            yaxis_title="해당 시점 처치 확률 %",
-            legend_title="총기 — σ 높을수록 빨강 / 선 모양은 겹침 구분",
-        )
-        st.plotly_chart(fig_pmf, use_container_width=True)
-
-    with cdf_tab:
-        fig_cdf = go.Figure()
-        for weapon_name in weapon_order_for_accuracy_graph:
-            weapon_df = all_distribution_df[all_distribution_df["weapon"] == weapon_name].sort_values("kill_time_sec")
-            if weapon_df.empty:
-                continue
-
-            color = sigma_color_map.get(weapon_name, "#666666")
-            dash_style = distribution_dash_map.get(weapon_name, "solid")
-            custom_data = weapon_df[[
-                "fired_shots",
-                "probability_percent",
-                "accuracy_percent",
-                "stk_needed_hits",
-                "mean_time_M_sec",
-                "sigma_sec",
-            ]].to_numpy()
-
-            fig_cdf.add_trace(
-                go.Scatter(
-                    x=weapon_df["kill_time_sec"],
-                    y=weapon_df["cumulative_percent"],
-                    mode="lines",
-                    line=dict(color=color, width=4, dash=dash_style),
-                    opacity=0.88,
-                    name=weapon_name,
-                    customdata=custom_data,
-                    hovertemplate=
-                        "총기: %{fullData.name}<br>"
-                        "시간: %{x:.3f} sec<br>"
-                        "총 발사탄 수: %{customdata[0]}발<br>"
-                        "명중률: %{customdata[2]:.2f}%<br>"
-                        "필요 명중탄 STK: %{customdata[3]}발<br>"
-                        "그 시점 단일 확률: %{customdata[1]:.2f}%<br>"
-                        "누적 처치 확률: %{y:.2f}%<br>"
-                        "평균 M: %{customdata[4]:.3f} sec<br>"
-                        "표준편차 σ: %{customdata[5]:.3f} sec"
-                        "<extra></extra>",
-                )
-            )
-
-        for target_percent in [50, 80, 95]:
-            fig_cdf.add_hline(
-                y=target_percent,
-                line_width=1,
-                line_dash="dot",
-                annotation_text=f"{target_percent}%",
-                annotation_position="right",
-            )
-
-        fig_cdf.update_layout(
-            title=f"누적 처치 확률 / 현재 거리 {distance}m",
-            xaxis_title="처치 시간 sec",
-            yaxis_title="누적 처치 확률 %",
-            yaxis=dict(range=[0, 100]),
-            legend_title="총기 — σ 높을수록 빨강 / 선 모양은 겹침 구분",
-        )
-        st.plotly_chart(fig_cdf, use_container_width=True)
-
-    with st.expander("처치 시간 분포 데이터 보기"):
-        dist_table = all_distribution_df.copy()
-        dist_table["kill_time_sec"] = dist_table["kill_time_sec"].round(3)
-        dist_table["probability_percent"] = dist_table["probability_percent"].round(3)
-        dist_table["cumulative_percent"] = dist_table["cumulative_percent"].round(3)
-        dist_table["accuracy_percent"] = dist_table["accuracy_percent"].round(2)
-        dist_table["mean_time_M_sec"] = dist_table["mean_time_M_sec"].round(3)
-        dist_table["sigma_sec"] = dist_table["sigma_sec"].round(3)
-        st.dataframe(
-            dist_table[[
-                "type",
-                "weapon",
-                "fired_shots",
-                "kill_time_sec",
-                "probability_percent",
-                "cumulative_percent",
-                "accuracy_percent",
-                "stk_needed_hits",
-                "mean_time_M_sec",
-                "sigma_sec",
-            ]].rename(columns={
-                "type": "타입",
-                "weapon": "총기",
-                "fired_shots": "총 발사탄 수",
-                "kill_time_sec": "처치 시간 sec",
-                "probability_percent": "해당 시점 처치 확률 %",
-                "cumulative_percent": "누적 처치 확률 %",
-                "accuracy_percent": "명중률 %",
-                "stk_needed_hits": "필요 명중탄 STK",
-                "mean_time_M_sec": "평균 M sec",
-                "sigma_sec": "표준편차 σ sec",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-st.subheader("거리별 개인 명중률 평균 처치 시간 그래프")
-st.caption(
-    "각 거리에서의 STK를 다시 계산한 뒤, 입력한 개인 명중률을 적용해 평균 처치 시간 M을 그립니다. "
-    "표준편차 옵션을 켜면 M ± σ 구간이 반투명 밴드로 표시됩니다."
-)
-
-show_accuracy_sigma_band = st.checkbox(
-    "표준편차 범위 표시 (M ± σ)",
-    value=True,
-    key="show_accuracy_sigma_band_distance_graph",
-)
-
-accuracy_sweep_rows = []
-
-for weapon in selected_weapon_data:
-    weapon_name = weapon["weapon"]
-    accuracy = float(accuracy_inputs.get(weapon_name, default_accuracy_for_weapon(weapon)))
-
-    for sweep_distance in range(0, max_graph_distance + 1):
-        base_row = weapon_result_row(
-            weapon=weapon,
-            distance=float(sweep_distance),
-            armor_plates=armor_plates,
-            hit_zone=hit_zone,
-        )
-        stats = calculate_accuracy_stats(
-            shots_to_kill=int(base_row["shots_to_kill"]),
-            rpm=float(base_row["rpm"]),
-            accuracy_percent=accuracy,
-        )
-
-        mean_sec = stats["mean_time_sec"]
-        sigma_sec = stats["sigma_time_sec"]
-        if mean_sec is None or sigma_sec is None:
-            continue
-
-        accuracy_sweep_rows.append({
-            "type": weapon["type"],
-            "weapon": weapon_name,
-            "distance": float(sweep_distance),
-            "accuracy_percent": accuracy,
-            "shots_to_kill": int(base_row["shots_to_kill"]),
-            "perfect_ttk_sec": base_row["ttk_sec"],
-            "mean_time_M_sec": mean_sec,
-            "sigma_sec": sigma_sec,
-            "mean_minus_sigma_sec": max(0.0, mean_sec - sigma_sec),
-            "mean_plus_sigma_sec": mean_sec + sigma_sec,
-            "expected_shots_fired": stats["expected_shots"],
-        })
-
-accuracy_sweep_df = pd.DataFrame(accuracy_sweep_rows)
-
-if accuracy_sweep_df.empty:
-    st.warning("거리별 개인 명중률 그래프를 만들 수 있는 데이터가 없습니다.")
-else:
-    fig_accuracy_distance = go.Figure()
-    weapon_order_for_graph = [weapon["weapon"] for weapon in selected_weapon_data]
-    color_map = sigma_color_map if "sigma_color_map" in globals() or "sigma_color_map" in locals() else color_map_by_sigma(accuracy_df, weapon_order_for_graph)
-
-    if show_accuracy_sigma_band:
-        for weapon_name in weapon_order_for_graph:
-            weapon_df = accuracy_sweep_df[accuracy_sweep_df["weapon"] == weapon_name].sort_values("distance")
-            if weapon_df.empty:
-                continue
-
-            color = color_map[weapon_name]
-            fill_color = hex_to_rgba(color, 0.18)
-
-            fig_accuracy_distance.add_trace(
-                go.Scatter(
-                    x=weapon_df["distance"],
-                    y=weapon_df["mean_plus_sigma_sec"],
-                    mode="lines",
-                    line=dict(width=0, color=fill_color),
-                    hoverinfo="skip",
-                    showlegend=False,
-                    name=f"{weapon_name} +σ",
-                )
-            )
-            fig_accuracy_distance.add_trace(
-                go.Scatter(
-                    x=weapon_df["distance"],
-                    y=weapon_df["mean_minus_sigma_sec"],
-                    mode="lines",
-                    line=dict(width=0, color=fill_color),
-                    fill="tonexty",
-                    fillcolor=fill_color,
-                    hoverinfo="skip",
-                    showlegend=False,
-                    name=f"{weapon_name} M ± σ",
-                )
-            )
-
-    for weapon_name in weapon_order_for_graph:
-        weapon_df = accuracy_sweep_df[accuracy_sweep_df["weapon"] == weapon_name].sort_values("distance")
-        if weapon_df.empty:
-            continue
-
-        color = color_map[weapon_name]
-        custom_data = weapon_df[[
-            "sigma_sec",
-            "accuracy_percent",
-            "shots_to_kill",
-            "expected_shots_fired",
-            "perfect_ttk_sec",
-        ]].to_numpy()
-
-        fig_accuracy_distance.add_trace(
-            go.Scatter(
-                x=weapon_df["distance"],
-                y=weapon_df["mean_time_M_sec"],
-                mode="lines",
-                line=dict(color=color, width=3),
-                name=weapon_name,
-                customdata=custom_data,
-                hovertemplate=
-                    "총기: %{fullData.name}<br>"
-                    "거리: %{x}m<br>"
-                    "명중률: %{customdata[1]:.1f}%<br>"
-                    "필요 명중탄 STK: %{customdata[2]}발<br>"
-                    "완전명중 TTK: %{customdata[4]:.3f} sec<br>"
-                    "평균 발사탄 수: %{customdata[3]:.2f}발<br>"
-                    "평균 처치 시간: %{y:.3f} sec<br>"
-                    "표준편차 σ: %{customdata[0]:.3f} sec"
-                    "<extra></extra>",
-            )
-        )
-
-    fig_accuracy_distance.update_layout(
-        title="Personal Accuracy / Distance / Mean Time To Kill",
-        xaxis_title="거리 m",
-        yaxis_title="평균 처치 시간 sec",
-        legend_title="총기",
-    )
-
-    st.plotly_chart(fig_accuracy_distance, use_container_width=True)
-
-with st.expander("개인 명중률 계산식 설명"):
-    st.write(
-        """
-        - 기존 TTK는 모든 탄이 명중한다고 가정한 값입니다.
-        - 개인 명중률 계산은 현재 거리/방탄판 조건에서 필요한 명중탄 수, 즉 STK를 먼저 구합니다.
-        - 그 다음 각 발이 입력한 명중률 p로 명중한다고 보고, k번째 명중이 나올 때까지 필요한 총 발사탄 수 N을 계산합니다.
-        - N은 음이항분포를 따릅니다.
-        - 재장전 시간은 반영하지 않습니다.
-        - 평균 처치 시간은 초(sec) 단위이며, σ는 처치 시간의 표준편차입니다.
-        - 확률분포/누적확률 그래프는 음이항분포를 직접 계산해 표시합니다.
-        """
-    )
-
-# =========================
-# 내장 데이터 확인
-# =========================
-
-with st.expander("내장 총기 데이터 확인"):
-    data_preview = []
-    for weapon in WEAPON_DATA:
-        data_preview.append({
-            "type": weapon["type"],
-            "weapon": weapon["weapon"],
-            "rpm": weapon["rpm"],
-            "firing_mode": weapon.get("firing_mode"),
-            "velocity": weapon.get("velocity"),
-            "mag_size": weapon.get("mag_size"),
-            "reload": weapon.get("reload"),
-            "damage_profile": damage_profile_to_text(weapon["damage_profile"]),
-        })
-    st.dataframe(pd.DataFrame(data_preview), use_container_width=True, hide_index=True)
-
-if SKIPPED_WEAPONS:
-    with st.expander("제외된 항목"):
-        st.write("원본 시트에서 RPM 또는 숫자형 거리별 Body Damage가 없어 내장 계산 데이터에서 제외했습니다.")
-        st.write(SKIPPED_WEAPONS)
+        render_app()
