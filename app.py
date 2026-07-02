@@ -1,5 +1,5 @@
 # app.py
-# Battlefield 6 TTK 계산기 - 내장 데이터 + 개인 명중률 거리별 그래프 v28
+# Battlefield 6 TTK 계산기 - Update 1.3.3.0 반영 v29
 # 실행:
 #   pip install streamlit pandas plotly
 #   py -m streamlit run app.py
@@ -20,10 +20,19 @@ import streamlit as st
 DEFAULT_HEALTH = 100
 ARMOR_HP_PER_PLATE = 40
 ARMOR_RANGE_PENALTY = 10.0
+PATCH_VERSION = "1.3.3.0 (2026-06-30)"
 
 # DMR과 Sidearm은 방탄판이 있어도 거리 +10m 데미지 모델 후퇴를 적용하지 않는다.
 # 단, 방탄판 HP 자체는 그대로 존재한다.
 ARMOR_RANGE_PENALTY_EXEMPT_TYPES = {"dmr", "sidearm"}
+
+# Update 1.3.3.0 신체 부위/방탄판 피해 배율.
+# 현재 내장 데이터에서 자동화기군은 Assault, Carbine, SMG, LMG이다.
+AUTOMATIC_PRIMARY_TYPES = {"assault", "carbine", "smg", "lmg"}
+HIT_ZONE_LABELS = {
+    "chest": "가슴",
+    "lower_body": "복부·팔다리",
+}
 
 # 배틀필드의 데미지 판정상 33.3333 * 3 = 99.9999 같은 값도 사망으로 처리되므로,
 # 프로그램에서는 모든 데미지를 소수점 셋째 자리까지 올림 처리한다.
@@ -1947,6 +1956,67 @@ WEAPON_DATA = [
     }
 ]
 
+# =========================
+# Update 1.3.3.0 데이터 보정
+# =========================
+
+# 공식 패치노트의 기본 총구속도 전/후 값이다.
+# 내장 데이터가 Extended Barrel 등 부착물 수치를 담고 있는 경우에도 기존 비율을 유지하도록
+# 현재 저장값에 (패치 후 기본값 / 패치 전 기본값)을 곱한다.
+PATCH_133_VELOCITY_BASE = {
+    "ES 5.7": (650.0, 510.0),
+    "LMR27": (880.0, 800.0),
+    "SCW-10": (428.0, 398.0),
+    "SG 553R": (519.0, 483.0),
+    "TR-7": (648.0, 604.0),
+    "NVO-228E": (671.0, 626.0),
+    "M417 A2": (600.0, 560.0),
+    "M121 A2": (600.0, 560.0),
+    "CZ3A1": (360.0, 336.0),
+    "M240L": (630.0, 590.0),
+    "M4A1": (630.0, 590.0),
+    "VCR-2": (704.0, 660.0),
+    "SOR-300SC": (563.0, 528.0),
+    "GRT-BC": (599.0, 563.0),
+    "RPKM": (670.0, 630.0),
+    "M123K": (670.0, 630.0),
+    "M433": (670.0, 630.0),
+    "SGX": (402.0, 378.0),
+    "QBZ-192": (644.0, 608.0),
+    "DRS-IAR": (720.0, 680.0),
+    "M/60": (720.0, 680.0),
+    "AK4D": (720.0, 680.0),
+    "PW5A3": (432.0, 408.0),
+    "M16A4 *": (720.0, 680.0),
+    "SVK-8.6": (720.0, 680.0),
+    "L110": (780.0, 740.0),
+    "B36A4": (780.0, 740.0),
+    "M277": (624.0, 592.0),
+    "M39 EMR": (800.0, 760.0),
+    "SVDM": (800.0, 760.0),
+    "GRT-CPS": (800.0, 760.0),
+    "M250": (760.0, 724.0),
+    "KORD 6P67": (760.0, 724.0),
+    "USG-90": (570.0, 543.0),
+    "SL9": (510.0, 486.0),
+    "L85A3": (814.0, 778.0),
+    "UMG-40": (488.0, 467.0),
+    "SOR-556 MK2": (800.0, 768.0),
+    "PW7A2": (600.0, 576.0),
+    "VZ. 61": (326.0, 313.0),
+    "AK-205": (737.0, 708.0),
+    "KTS100 MK8": (840.0, 808.0),
+    "RPK-74M *": (840.0, 808.0),
+    "KV9": (348.0, 362.0),
+}
+
+for _weapon in WEAPON_DATA:
+    _velocity_change = PATCH_133_VELOCITY_BASE.get(_weapon.get("weapon"))
+    if _velocity_change and _weapon.get("velocity") is not None:
+        _old_base, _new_base = _velocity_change
+        _weapon["velocity"] = round(float(_weapon["velocity"]) * _new_base / _old_base, 3)
+
+
 # 원본 시트에서 RPM 또는 숫자형 거리별 데미지가 부족해서 제외된 항목입니다.
 SKIPPED_WEAPONS = [
     "PP-19 *",
@@ -1975,8 +2045,8 @@ def ceil_damage(value: float, decimals: int = DAMAGE_CEIL_DECIMALS) -> float:
     return math.ceil(float(value) * factor - 1e-12) / factor
 
 
-def get_damage_at_range(profile: List[Dict], distance: float) -> float:
-    """거리별 데미지 프로필에서 현재 거리의 데미지를 반환한다."""
+def get_raw_damage_at_range(profile: List[Dict], distance: float) -> float:
+    """거리별 데미지 프로필에서 반올림 전 원시 데미지를 반환한다."""
     if not profile:
         return 0.0
 
@@ -1986,9 +2056,48 @@ def get_damage_at_range(profile: List[Dict], distance: float) -> float:
         max_range_value = math.inf if max_range is None else float(max_range)
 
         if min_range <= distance < max_range_value:
-            return ceil_damage(item["damage"])
+            return float(item["damage"])
 
-    return ceil_damage(profile[-1]["damage"])
+    return float(profile[-1]["damage"])
+
+
+def get_damage_at_range(
+    profile: List[Dict],
+    distance: float,
+    multiplier: float = 1.0,
+) -> float:
+    """거리 데미지에 신체/방탄판 배율을 적용한 뒤 소수점 셋째 자리까지 올림한다."""
+    raw_damage = get_raw_damage_at_range(profile, distance)
+    return ceil_damage(raw_damage * float(multiplier))
+
+
+def damage_multiplier_for_hit(
+    weapon_type: str,
+    hit_zone: str = "chest",
+    armor_active: bool = False,
+) -> float:
+    """Update 1.3.3.0 기준 신체 부위 및 방탄판 피해 배율을 반환한다."""
+    type_name = str(weapon_type).strip().lower()
+    zone = str(hit_zone).strip().lower()
+
+    if type_name in AUTOMATIC_PRIMARY_TYPES:
+        if armor_active or zone == "lower_body":
+            return 0.84
+        return 1.0
+
+    if type_name == "dmr":
+        if armor_active or zone == "lower_body":
+            return 0.91
+        return 1.0
+
+    # 현재 앱에 저격소총 데이터는 없지만, 향후 추가 시 공식 배율을 그대로 사용한다.
+    if type_name in {"sniper", "sniper rifle", "bolt-action", "bolt action"}:
+        if armor_active or zone == "lower_body":
+            return 0.67
+        return 1.0
+
+    # Update 1.3.3.0에서 산탄총과 보조무기는 신체 배율 변경 대상에서 제외됐다.
+    return 1.0
 
 
 def armor_range_penalty_applies(weapon_type: str) -> bool:
@@ -2019,6 +2128,7 @@ def calculate_ttk(
     distance: float,
     armor_plates: int,
     weapon_type: str = "",
+    hit_zone: str = "chest",
     base_health: float = DEFAULT_HEALTH,
     armor_hp_per_plate: float = ARMOR_HP_PER_PLATE,
     armor_range_penalty: float = ARMOR_RANGE_PENALTY,
@@ -2033,6 +2143,8 @@ def calculate_ttk(
     - 방탄판 2장: Armor 80 + HP 100
     - 방탄판이 1이라도 남아 있으면 해당 탄환은 거리 +10m 데미지 적용
     - 단, DMR과 Sidearm은 방탄판이 있어도 거리 +10m 후퇴를 적용하지 않음
+    - Update 1.3.3.0 방탄판 배율: 자동화기 0.84x, DMR 0.91x, 저격소총 0.67x
+    - 복부·팔다리 배율도 자동화기 0.84x, DMR 0.91x, 저격소총 0.67x
     - 방탄판 초과 피해는 HP로 넘어간다.
     """
     health = float(base_health)
@@ -2051,7 +2163,16 @@ def calculate_ttk(
         else:
             effective_distance = distance
 
-        damage = get_damage_at_range(profile, effective_distance)
+        multiplier = damage_multiplier_for_hit(
+            weapon_type=weapon_type,
+            hit_zone=hit_zone,
+            armor_active=armor_hp > 0,
+        )
+        damage = get_damage_at_range(
+            profile,
+            effective_distance,
+            multiplier=multiplier,
+        )
 
         if armor_hp > 0:
             if damage <= armor_hp:
@@ -2226,24 +2347,47 @@ def default_accuracy_for_weapon(weapon: Dict) -> float:
         return 33.0
     return 25.0
 
-def weapon_result_row(weapon: Dict, distance: float, armor_plates: int) -> Dict:
+def weapon_result_row(
+    weapon: Dict,
+    distance: float,
+    armor_plates: int,
+    hit_zone: str = "chest",
+) -> Dict:
     profile = weapon["damage_profile"]
     rpm = float(weapon["rpm"])
+    weapon_type = weapon.get("type", "")
     result = calculate_ttk(
         profile=profile,
         rpm=rpm,
         distance=distance,
         armor_plates=armor_plates,
-        weapon_type=weapon.get("type", ""),
+        weapon_type=weapon_type,
+        hit_zone=hit_zone,
     )
 
-    actual_damage = get_damage_at_range(profile, distance)
+    normal_multiplier = damage_multiplier_for_hit(
+        weapon_type=weapon_type,
+        hit_zone=hit_zone,
+        armor_active=False,
+    )
+    armor_multiplier = damage_multiplier_for_hit(
+        weapon_type=weapon_type,
+        hit_zone=hit_zone,
+        armor_active=True,
+    )
+    actual_damage = get_damage_at_range(
+        profile,
+        distance,
+        multiplier=normal_multiplier,
+    )
+    armor_effective_distance = effective_distance_against_armor(
+        weapon_type=weapon_type,
+        distance=distance,
+    )
     armor_damage = get_damage_at_range(
         profile,
-        effective_distance_against_armor(
-            weapon_type=weapon.get("type", ""),
-            distance=distance,
-        ),
+        armor_effective_distance,
+        multiplier=armor_multiplier,
     )
 
     return {
@@ -2255,15 +2399,25 @@ def weapon_result_row(weapon: Dict, distance: float, armor_plates: int) -> Dict:
         "reload": weapon.get("reload"),
         "velocity": weapon.get("velocity"),
         "distance": distance,
+        "hit_zone": hit_zone,
+        "hit_zone_label": HIT_ZONE_LABELS.get(hit_zone, hit_zone),
         "armor_plates": armor_plates,
+        "normal_damage_multiplier": normal_multiplier,
+        "armor_damage_multiplier": armor_multiplier,
         "normal_damage_at_distance": actual_damage,
-        "armor_damage_at_distance_plus_10m": armor_damage,
+        "armor_effective_distance": armor_effective_distance,
+        "armor_damage_at_effective_distance": armor_damage,
         "shots_to_kill": result["shots_to_kill"],
         "ttk_sec": result["ttk"],
     }
 
 
-def sweep_weapon(weapon: Dict, armor_plates: int, max_distance: int = 100) -> pd.DataFrame:
+def sweep_weapon(
+    weapon: Dict,
+    armor_plates: int,
+    max_distance: int = 100,
+    hit_zone: str = "chest",
+) -> pd.DataFrame:
     rows = []
     for distance in range(0, max_distance + 1):
         rows.append(
@@ -2271,6 +2425,7 @@ def sweep_weapon(weapon: Dict, armor_plates: int, max_distance: int = 100) -> pd
                 weapon=weapon,
                 distance=float(distance),
                 armor_plates=armor_plates,
+                hit_zone=hit_zone,
             )
         )
     return pd.DataFrame(rows)
@@ -2488,6 +2643,52 @@ DUEL_RECOIL_DATA = {
     "VZ. 61": {"vertical": 0.78, "direction_var": 42.0},
 }
 
+# Update 1.3.3.0 공식 Recoil Variation 값. 기존 vertical 값은 유지하고 방향 편차만 교체한다.
+PATCH_133_RECOIL_VARIATION = {
+    "TR-7": 40.8,
+    "AK4D": 20.0,
+    "NVO-228E": 28.9,
+    "VCR-2": 50.3,
+    "M433": 41.4,
+    "M16A4 *": 37.5,
+    "B36A4": 28.0,
+    "L85A3": 22.8,
+    "SOR-556 MK2": 12.7,
+    "KORD 6P67": 28.9,
+    "M417 A2": 15.4,
+    "SG 553R": 35.8,
+    "SOR-300SC": 15.8,
+    "M277": 34.4,
+    "M4A1": 30.7,
+    "GRT-BC": 26.1,
+    "QBZ-192": 19.9,
+    "AK-205": 7.4,
+    "RPKM": 17.5,
+    "DRS-IAR": 29.3,
+    "KTS100 MK8": 9.5,
+    "RPK-74M *": 16.1,
+    "M121 A2": 31.8,
+    "M240L": 34.5,
+    "M/60": 29.9,
+    "M250": 35.9,
+    "M123K": 47.7,
+    "L110": 31.0,
+    "SCW-10": 33.5,
+    "UMG-40": 13.0,
+    "KV9": 50.0,
+    "CZ3A1": 50.8,
+    "SGX": 31.7,
+    "PW5A3": 28.3,
+    "SL9": 13.0,
+    "USG-90": 35.5,
+    "PW7A2": 27.8,
+    "VZ. 61": 18.4,
+}
+
+for _weapon_name, _direction_var in PATCH_133_RECOIL_VARIATION.items():
+    if _weapon_name in DUEL_RECOIL_DATA:
+        DUEL_RECOIL_DATA[_weapon_name]["direction_var"] = _direction_var
+
 
 def duel_recoil_for_weapon(weapon: Dict) -> Dict[str, float]:
     """1:1 비교용 반동 데이터를 반환한다. 없으면 타입별 기본값을 쓴다."""
@@ -2581,6 +2782,7 @@ def duel_variable_accuracy_distribution(
     weapon: Dict,
     distance: float,
     armor_plates: int,
+    hit_zone: str = "chest",
     cdf_cutoff: float = 0.999,
     max_shots: int = 500,
 ) -> pd.DataFrame:
@@ -2594,6 +2796,7 @@ def duel_variable_accuracy_distribution(
         weapon=weapon,
         distance=float(distance),
         armor_plates=int(armor_plates),
+        hit_zone=hit_zone,
     )
     stk = int(base_row["shots_to_kill"])
     rpm = max(float(base_row["rpm"]), 1.0)
@@ -2710,6 +2913,7 @@ def duel_distance_sweep_win_probability(
     weapon_a: Dict,
     weapon_b: Dict,
     armor_plates: int,
+    hit_zone: str = "chest",
     min_distance: int = 15,
     max_distance: int = 100,
     step: int = 1,
@@ -2726,11 +2930,13 @@ def duel_distance_sweep_win_probability(
             weapon_a,
             distance=float(distance_value),
             armor_plates=int(armor_plates),
+            hit_zone=hit_zone,
         )
         df_b = duel_variable_accuracy_distribution(
             weapon_b,
             distance=float(distance_value),
             armor_plates=int(armor_plates),
+            hit_zone=hit_zone,
         )
 
         a_win, b_win, tie_probability = duel_win_probability(df_a, df_b)
@@ -2758,7 +2964,10 @@ st.set_page_config(
 )
 
 st.title("Battlefield 6 총기 TTK 계산기")
-st.caption("엑셀 업로드 없이 내장된 총기 데이터로 TTK와 개인 명중률 기반 평균 처치 시간을 비교합니다.")
+st.caption(
+    f"Update {PATCH_VERSION} 반영: 방탄판/신체 피해 배율, 공식 반동 방향 편차, 총구속도 보정. "
+    "거리별 기본 데미지 프로필은 기존 내장 데이터를 사용하며, 탄속과 Bullet Drag는 TTK 산식에 포함하지 않습니다."
+)
 
 # 타입 순서는 원본 데이터 등장 순서를 유지한다.
 type_order = []
@@ -2825,6 +3034,15 @@ armor_plates = st.sidebar.radio(
     index=0,
     horizontal=True,
 )
+
+hit_zone_label = st.sidebar.radio(
+    "피격 부위",
+    ["가슴", "복부·팔다리"],
+    index=0,
+    horizontal=True,
+    help="머리 배율은 탄약 종류에 따라 달라 현재 버전에서는 제외했습니다.",
+)
+hit_zone = "chest" if hit_zone_label == "가슴" else "lower_body"
 
 # 슬라이더와 +/- number_input을 동기화한다.
 if "distance_value" not in st.session_state:
@@ -2920,7 +3138,8 @@ selected_weapon_labels = unique_labels_preserve_order(
 st.subheader("반동 기반 1:1 승률 비교")
 st.caption(
     "15m까지는 두 총기 모두 기본 명중률 25%로 고정하고, 15m 이후부터는 반동과 거리로 계산한 "
-    "기하학적 감쇠율을 적용합니다. 방탄판 설정은 왼쪽 사이드바의 값을 사용합니다."
+    "기하학적 감쇠율을 적용합니다. 방탄판과 피격 부위 설정은 왼쪽 사이드바의 값을 사용합니다. "
+    "1.3.3.0의 공식 반동 방향 편차는 반영했지만, 총기별 세부 탄퍼짐 수치는 공개되지 않아 탄퍼짐 증가는 직접 계산하지 않습니다."
 )
 
 duel_weapon_options = [
@@ -3012,11 +3231,13 @@ if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
             duel_weapon_a,
             distance=float(duel_distance),
             armor_plates=int(armor_plates),
+            hit_zone=hit_zone,
         )
         duel_df_b = duel_variable_accuracy_distribution(
             duel_weapon_b,
             distance=float(duel_distance),
             armor_plates=int(armor_plates),
+            hit_zone=hit_zone,
         )
 
         a_win, b_win, tie_probability = duel_win_probability(duel_df_a, duel_df_b)
@@ -3029,8 +3250,8 @@ if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
         p95_a = duel_distribution_quantile(duel_df_a, 0.95)
         p95_b = duel_distribution_quantile(duel_df_b, 0.95)
 
-        base_a = weapon_result_row(duel_weapon_a, float(duel_distance), int(armor_plates))
-        base_b = weapon_result_row(duel_weapon_b, float(duel_distance), int(armor_plates))
+        base_a = weapon_result_row(duel_weapon_a, float(duel_distance), int(armor_plates), hit_zone=hit_zone)
+        base_b = weapon_result_row(duel_weapon_b, float(duel_distance), int(armor_plates), hit_zone=hit_zone)
 
         p_a_first = duel_hit_probability_for_shot(duel_weapon_a, float(duel_distance), 1) * 100.0
         p_b_first = duel_hit_probability_for_shot(duel_weapon_b, float(duel_distance), 1) * 100.0
@@ -3094,6 +3315,7 @@ if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
             duel_weapon_a,
             duel_weapon_b,
             armor_plates=int(armor_plates),
+            hit_zone=hit_zone,
             min_distance=15,
             max_distance=100,
             step=1,
@@ -3163,6 +3385,8 @@ if duel_a_label != "선택 안 함" and duel_b_label != "선택 안 함":
             st.write(
                 """
                 - 15m 이하는 두 총기의 기본 명중률을 모두 25%로 고정합니다.
+                - Update 1.3.3.0의 공식 Recoil Variation 값을 적용했습니다.
+                - 총기별 정확한 Dispersion Growth 수치는 공개되지 않아 탄퍼짐 변화는 이 승률 모델에 포함하지 않았습니다.
                 - 15m를 넘으면 `G(n,d) / G(n,15m)` 감쇠율을 곱합니다.
                 - `G(n,d)`는 표적 너비/높이가 거리에서 차지하는 허용각과, n번째 탄의 반동 오차를 비교한 기하학 값입니다.
                 - 15~40m는 10발 단위, 40m 초과는 8발 단위로 반동 패턴이 리셋된다고 가정합니다.
@@ -3194,7 +3418,12 @@ if searched_weapon_options:
     st.sidebar.caption("검색으로 추가한 총기는 무기 타입 필터와 관계없이 비교 대상에 포함됩니다.")
 
 summary_rows = [
-    weapon_result_row(weapon=w, distance=float(distance), armor_plates=armor_plates)
+    weapon_result_row(
+        weapon=w,
+        distance=float(distance),
+        armor_plates=armor_plates,
+        hit_zone=hit_zone,
+    )
     for w in selected_weapon_data
 ]
 summary_df = pd.DataFrame(summary_rows)
@@ -3208,10 +3437,17 @@ summary_df = summary_df.sort_values(["ttk_sec", "shots_to_kill", "weapon"]).rese
 left, right = st.columns([1.35, 1])
 
 with left:
-    st.subheader(f"{distance}m 기준 비교")
+    st.subheader(f"{distance}m / {hit_zone_label} 기준 비교")
 
     display_df = summary_df.copy()
-    for col in ["ttk_sec", "normal_damage_at_distance", "armor_damage_at_distance_plus_10m", "reload"]:
+    for col in [
+        "ttk_sec",
+        "normal_damage_at_distance",
+        "armor_effective_distance",
+        "armor_damage_multiplier",
+        "armor_damage_at_effective_distance",
+        "reload",
+    ]:
         if col in display_df.columns:
             display_df[col] = display_df[col].round(3)
 
@@ -3222,8 +3458,11 @@ with left:
             "rpm",
             "firing_mode",
             "reload",
+            "hit_zone_label",
             "normal_damage_at_distance",
-            "armor_damage_at_distance_plus_10m",
+            "armor_effective_distance",
+            "armor_damage_multiplier",
+            "armor_damage_at_effective_distance",
             "armor_plates",
             "shots_to_kill",
             "ttk_sec",
@@ -3234,8 +3473,11 @@ with left:
         "rpm": "RPM",
         "firing_mode": "발사모드",
         "reload": "재장전",
-        "normal_damage_at_distance": "기준 데미지",
-        "armor_damage_at_distance_plus_10m": "방탄판 데미지",
+        "hit_zone_label": "피격 부위",
+        "normal_damage_at_distance": "일반 데미지",
+        "armor_effective_distance": "방탄판 판정 거리",
+        "armor_damage_multiplier": "방탄판 배율",
+        "armor_damage_at_effective_distance": "방탄판 적용 데미지",
         "armor_plates": "방탄판",
         "shots_to_kill": "STK",
         "ttk_sec": "TTK",
@@ -3252,21 +3494,23 @@ with right:
 
     if armor_plates == 0:
         st.write(
-            """
-            **방탄판 0장**
+            f"""
+            **방탄판 0장 / {hit_zone_label} 피격**
             - HP: 100
             - 플레이트 없음
             - 실제 거리 기준 데미지 적용
+            - 복부·팔다리 선택 시 자동화기 0.84x, DMR 0.91x 적용
             """
         )
     else:
         st.write(
             f"""
-            **방탄판 {armor_plates}장**
+            **방탄판 {armor_plates}장 / {hit_zone_label} 피격**
             - HP: 100
             - 플레이트 HP: {armor_plates * ARMOR_HP_PER_PLATE}
             - 플레이트가 남아 있으면 해당 탄환은 **거리 +{ARMOR_RANGE_PENALTY:.0f}m 데미지** 적용
             - 단, **DMR / Sidearm은 거리 +{ARMOR_RANGE_PENALTY:.0f}m 후퇴 미적용**
+            - 방탄판 피해 배율: 자동화기 **0.84x**, DMR **0.91x**, 저격소총 **0.67x**, Sidearm **1.0x**
             - 플레이트 초과 피해는 HP로 넘어감
             """
         )
@@ -3286,7 +3530,15 @@ with right:
 st.subheader("거리별 TTK 그래프")
 
 sweep_df = pd.concat(
-    [sweep_weapon(w, armor_plates=armor_plates, max_distance=max_graph_distance) for w in selected_weapon_data],
+    [
+        sweep_weapon(
+            w,
+            armor_plates=armor_plates,
+            max_distance=max_graph_distance,
+            hit_zone=hit_zone,
+        )
+        for w in selected_weapon_data
+    ],
     ignore_index=True,
 )
 sweep_df["ttk_ms"] = sweep_df["ttk_sec"] * 1000
@@ -3669,6 +3921,7 @@ for weapon in selected_weapon_data:
             weapon=weapon,
             distance=float(sweep_distance),
             armor_plates=armor_plates,
+            hit_zone=hit_zone,
         )
         stats = calculate_accuracy_stats(
             shots_to_kill=int(base_row["shots_to_kill"]),
