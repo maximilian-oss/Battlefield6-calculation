@@ -8,7 +8,8 @@
 # - Armor damage curve uses +10 m extended drop-off ranges
 # - Update 1.3.3.0 automatic-weapon body/chest damage vs armor: 0.84x
 # - Selectable vertical recoil control for all weapons: 0%, 50%, 70%, or 80%
-# - Monte Carlo trials: exactly 262,144 per weapon and selected distance
+# - Search and select only the weapons to calculate; autocomplete shows weapon names only
+# - Monte Carlo trials: exactly 262,144 per selected weapon and selected distance
 # - Practical STK includes every missed round fired before the kill
 # - Each Monte Carlo engagement tracks its own consecutive-miss streak
 # - After 4 consecutive misses, that engagement waits until 0.2 s after the
@@ -40,7 +41,7 @@ except ImportError:  # allows command-line self-test without Streamlit installed
 # Fixed model settings
 # ============================================================
 
-BUILD_ID = "BF6-MC-262144-VCONTROL-4MISS-ARMOR-R7"
+BUILD_ID = "BF6-MC-262144-SEARCH-CLASSCOLOR-R8"
 MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 armor"
 TRIALS_PER_WEAPON = 262_144
 VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80)
@@ -719,6 +720,37 @@ def _format_results(results: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+CLASS_ROW_BACKGROUND = {
+    # Muted, semi-transparent backgrounds: category is encoded by the row, not the text.
+    "Assault": "rgba(132, 92, 92, 0.24)",
+    "Carbine": "rgba(86, 118, 96, 0.24)",
+    "SMG": "rgba(83, 102, 127, 0.24)",
+    "LMG": "rgba(126, 116, 77, 0.24)",
+}
+
+
+def _style_results_by_class(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """Apply a muted background to every cell in a row according to weapon class."""
+    def style_row(row: pd.Series) -> list[str]:
+        background = CLASS_ROW_BACKGROUND.get(str(row.get("종류", "")), "transparent")
+        return [f"background-color: {background}"] * len(row)
+
+    return frame.style.apply(style_row, axis=1)
+
+
+def _class_color_legend_html() -> str:
+    labels = []
+    for class_name in ("Assault", "Carbine", "SMG", "LMG"):
+        color = CLASS_ROW_BACKGROUND[class_name]
+        labels.append(
+            f'<span style="display:inline-block; padding:0.28rem 0.62rem; '
+            f'margin:0 0.35rem 0.35rem 0; border-radius:0.35rem; '
+            f'background:{color}; border:1px solid rgba(127,127,127,0.22);">'
+            f'{class_name}</span>'
+        )
+    return "".join(labels)
+
+
 def render_app() -> None:
     if st is None:
         raise RuntimeError("Streamlit is not installed")
@@ -726,7 +758,22 @@ def render_app() -> None:
     st.set_page_config(page_title="BF6 Practical STK / TTK", layout="wide")
     st.title("Battlefield 6 실전 STK / TTK")
     st.caption(
-        f"BUILD {BUILD_ID} · {MODEL_VERSION} · 총기당 {TRIALS_PER_WEAPON:,}회 고정"
+        f"BUILD {BUILD_ID} · {MODEL_VERSION} · 선택한 총기마다 {TRIALS_PER_WEAPON:,}회 고정"
+    )
+
+    weapon_names = sorted(weapon["weapon"] for weapon in WEAPON_DATA)
+    weapon_by_name = {weapon["weapon"]: weapon for weapon in WEAPON_DATA}
+
+    st.subheader("총기 검색")
+    selected_weapon_names = st.multiselect(
+        "계산할 총기",
+        options=weapon_names,
+        default=[],
+        placeholder="총기 이름을 입력하세요 (예: M433)",
+        help=(
+            "검색과 자동완성 목록에는 Assault/M433 같은 형식이 아니라 "
+            "M433처럼 총기 이름만 표시됩니다. 여러 총기를 동시에 선택할 수 있습니다."
+        ),
     )
 
     control_col, armor_col, distance_col = st.columns([1.25, 1.0, 2.0])
@@ -760,40 +807,49 @@ def render_app() -> None:
         )
 
     st.info(
-        "실전 STK는 빗나간 탄까지 포함해 처치까지 실제 발사한 총탄 수입니다. "
-        "선택한 수직 반동 제어율은 모든 총기에 동일하게 적용되며 수평 반동에는 적용되지 않습니다. "
-        "각 몬테카를로 교전에서 4발 연속으로 빗나가면 다음 발은 직전 발사 0.2초 후에 나갑니다. "
-        "한 발이라도 명중하면 연속 미스 카운터는 0으로 초기화됩니다. "
-        "방탄판은 1장당 40 HP의 전역 추가 체력입니다. 방탄이 남아 있으면 데미지 구간을 "
-        "10m 연장해 조회하고 자동화기 몸통/가슴 데미지에 0.84배를 적용합니다. "
-        "방탄 초과 데미지는 체력으로 넘어가며, 방탄이 소진된 뒤에는 실제 거리의 일반 데미지를 적용합니다. "
-        "같은 거리·같은 제어율·같은 방탄판 조건에서 끝난 총기는 캐시에서 즉시 불러옵니다."
+        "선택한 총기만 각각 262,144회 계산합니다. 실전 STK는 빗나간 탄까지 포함해 "
+        "처치까지 실제 발사한 총탄 수입니다. 각 몬테카를로 교전에서 4발 연속으로 "
+        "빗나가면 다음 발은 직전 발사 0.2초 후에 나가며, 한 발이라도 명중하면 "
+        "연속 미스 카운터가 초기화됩니다. 방탄판은 1장당 40 HP이고, 방탄이 남아 "
+        "있는 동안 +10m 데미지 구간 연장과 자동화기 몸통 0.84배가 적용됩니다."
     )
 
+    if not selected_weapon_names:
+        st.warning("검색창에서 계산할 총기를 한 개 이상 선택하세요.")
+        return
+
+    selected_weapons = [weapon_by_name[name] for name in selected_weapon_names]
+    selected_ids = tuple(sorted(weapon["id"] for weapon in selected_weapons))
+
     calculate = st.button(
-        f"37종 전체 × {TRIALS_PER_WEAPON:,}회 계산 · 수직 제어 {vertical_recoil_control_percent}% · 방탄판 {armor_plates}장",
+        f"선택한 {len(selected_weapons)}종 × {TRIALS_PER_WEAPON:,}회 계산 · "
+        f"수직 제어 {vertical_recoil_control_percent}% · 방탄판 {armor_plates}장",
         type="primary",
         use_container_width=True,
     )
 
     request_key = (
-        f"distance-{int(distance_m)}-vertical-control-"
-        f"{int(vertical_recoil_control_percent)}-armor-{int(armor_plates)}"
+        selected_ids,
+        int(distance_m),
+        int(vertical_recoil_control_percent),
+        int(armor_plates),
     )
     if calculate:
-        st.session_state["bf6_requested_key"] = request_key
+        st.session_state["bf6_requested_key_r8"] = request_key
 
-    if st.session_state.get("bf6_requested_key") != request_key:
-        st.warning("거리를 정한 뒤 계산 버튼을 누르세요.")
+    if st.session_state.get("bf6_requested_key_r8") != request_key:
+        st.warning("총기와 조건을 정한 뒤 계산 버튼을 누르세요.")
         return
 
     progress = st.progress(0.0, text="계산 준비 중…")
     status = st.empty()
     rows: list[dict[str, Any]] = []
-    for index, weapon in enumerate(WEAPON_DATA, start=1):
+    total_selected = len(selected_weapons)
+
+    for index, weapon in enumerate(selected_weapons, start=1):
         status.write(
-            f"{index}/{len(WEAPON_DATA)} — {weapon['class']} | {weapon['weapon']} "
-            f"({TRIALS_PER_WEAPON:,}회)"
+            f"{index}/{total_selected} — {weapon['weapon']} "
+            f"({weapon['class']}, {TRIALS_PER_WEAPON:,}회)"
         )
         rows.append(
             simulate_weapon(
@@ -807,12 +863,13 @@ def render_app() -> None:
             )
         )
         progress.progress(
-            index / len(WEAPON_DATA),
-            text=f"{index}/{len(WEAPON_DATA)} 완료",
+            index / total_selected,
+            text=f"{index}/{total_selected} 완료",
         )
 
     progress.empty()
     status.empty()
+
     results = pd.DataFrame(rows).sort_values(
         ["ttk_mean_s", "practical_stk_mean", "weapon"],
         ascending=[True, True, True],
@@ -845,16 +902,27 @@ def render_app() -> None:
     ]
 
     st.subheader(
-        f"{int(distance_m)}m · 방탄판 {int(armor_plates)}장 — 자동화기 37종"
+        f"{int(distance_m)}m · 방탄판 {int(armor_plates)}장 — 선택한 {len(selected_weapons)}종"
     )
-    st.dataframe(view[columns], use_container_width=True, hide_index=True)
+    st.markdown(_class_color_legend_html(), unsafe_allow_html=True)
 
-    csv_bytes = view[columns].to_csv(index=False).encode("utf-8-sig")
+    table = view[columns].copy()
+    styled_table = _style_results_by_class(table)
+    st.dataframe(
+        styled_table,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    csv_bytes = table.to_csv(index=False).encode("utf-8-sig")
+    selected_slug = "-".join(weapon["id"] for weapon in selected_weapons)
+    if len(selected_slug) > 80:
+        selected_slug = f"{len(selected_weapons)}-weapons"
     st.download_button(
         "현재 결과 CSV 다운로드",
         data=csv_bytes,
         file_name=(
-            f"bf6_mc_{int(distance_m)}m_vcontrol-"
+            f"bf6_mc_{selected_slug}_{int(distance_m)}m_vcontrol-"
             f"{int(vertical_recoil_control_percent)}pct_"
             f"armor-{int(armor_plates)}_"
             f"{TRIALS_PER_WEAPON}.csv"
@@ -865,7 +933,8 @@ def render_app() -> None:
     with st.expander("계산 정의"):
         st.write(
             {
-                "시행 횟수": f"총기마다 정확히 {TRIALS_PER_WEAPON:,}회",
+                "선택 총기": selected_weapon_names,
+                "시행 횟수": f"선택한 총기마다 정확히 {TRIALS_PER_WEAPON:,}회",
                 "수직 반동 제어": f"{vertical_recoil_control_percent}%",
                 "방탄판": f"{armor_plates}장 / {armor_plates * ARMOR_HP_PER_PLATE:.0f} HP",
                 "방탄 데미지 구간": (
@@ -887,15 +956,11 @@ def render_app() -> None:
                     "각 교전에서 명중 시 카운터 0; 연속 4회 빗나가면 "
                     "다음 발까지 총 간격 0.2초 후 카운터 0"
                 ),
+                "표 색상": "Assault/Carbine/SMG/LMG별 저채도 반투명 행 배경",
                 "탄속/비행시간": "TTK에 미포함",
                 "데미지 모델": MODEL_VERSION,
-                "방탄판 공식 근거": (
-                    "EA REDSEC Armor: 40 HP/plate, 80 HP maximum, +10m drop-off extension; "
-                    "EA Update 1.3.3.0: automatic chest damage vs armor 0.84x"
-                ),
             }
         )
-
 
 def self_test() -> None:
     # Deterministic rule test: hit, miss, miss, miss, miss -> pause on final miss.
