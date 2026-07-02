@@ -3,12 +3,16 @@
 # FINAL single-file Streamlit app rebuilt from the working Monte Carlo engine.
 #
 # Fixed model:
-# - Pre-1.3.3.0 automatic-primary weapon data (37 weapons)
+# - Pre-1.3.3.0 automatic-primary weapon/recoil/spread data (37 weapons)
+# - Selectable armor: 0, 1, or 2 plates (40 HP each)
+# - Armor damage curve uses +10 m extended drop-off ranges
+# - Update 1.3.3.0 automatic-weapon body/chest damage vs armor: 0.84x
 # - Selectable vertical recoil control for all weapons: 0%, 50%, 70%, or 80%
 # - Monte Carlo trials: exactly 262,144 per weapon and selected distance
 # - Practical STK includes every missed round fired before the kill
-# - If the unconditional hit probability of a shot index falls to 20% or less,
-#   the next shot is delayed until 0.2 s after the previous shot
+# - Each Monte Carlo engagement tracks its own consecutive-miss streak
+# - After 4 consecutive misses, that engagement waits until 0.2 s after the
+#   previous shot before firing again; any hit resets the miss streak
 # - No external JSON/CSV files are required
 #
 # Run:
@@ -36,8 +40,8 @@ except ImportError:  # allows command-line self-test without Streamlit installed
 # Fixed model settings
 # ============================================================
 
-BUILD_ID = "BF6-MC-262144-VERTICAL-CONTROL-FINAL-R5"
-MODEL_VERSION = "pre-1.3.3.0"
+BUILD_ID = "BF6-MC-262144-VCONTROL-4MISS-ARMOR-R7"
+MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 armor"
 TRIALS_PER_WEAPON = 262_144
 VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80)
 DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT = 0
@@ -45,9 +49,13 @@ BASE_RANDOM_SEED = 20_260_702
 MAX_SHOTS = 240
 TARGET_HEALTH = 100.0
 HEAD_MULTIPLIER = 1.34
+ARMOR_PLATE_OPTIONS = (0, 1, 2)
+ARMOR_HP_PER_PLATE = 40.0
+ARMOR_DAMAGE_RANGE_EXTENSION_M = 10.0
+AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER = 0.84
 AIM_POINT_Y_M = 1.315
-LOW_ACCURACY_THRESHOLD = 0.20
-LOW_ACCURACY_INTERVAL_S = 0.20
+CONSECUTIVE_MISSES_BEFORE_PAUSE = 4
+MISS_STREAK_PAUSE_INTERVAL_S = 0.20
 SIMULATION_FRAME_S = 1.0 / 60.0
 DAMAGE_EPSILON = 1e-6
 
@@ -154,6 +162,24 @@ def damage_at_distance(profile: list[dict[str, Any]], distance_m: float) -> floa
     return _ceil_damage(float(profile[-1]["damage"]))
 
 
+def armor_curve_distance(distance_m: float) -> float:
+    """
+    REDSEC armor extends every damage drop-off threshold by 10 m.
+    Looking up the ordinary curve at max(distance - 10, 0) is equivalent.
+    """
+    return max(0.0, float(distance_m) - ARMOR_DAMAGE_RANGE_EXTENSION_M)
+
+
+def automatic_body_damage_vs_armor(
+    profile: list[dict[str, Any]],
+    distance_m: float,
+) -> float:
+    shifted_base = damage_at_distance(profile, armor_curve_distance(distance_m))
+    return _ceil_damage(
+        shifted_base * AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER
+    )
+
+
 # ============================================================
 # Recoil and spread recovery
 # ============================================================
@@ -241,6 +267,49 @@ def recover_spread(
     return output
 
 
+def recover_spread_array(
+    spread_deg: np.ndarray,
+    minimum_deg: float,
+    maximum_deg: float,
+    duration_s: float,
+    coefficient: float,
+    exponent: float,
+    offset: float,
+) -> np.ndarray:
+    """Vectorized spread recovery for trials with the same time interval."""
+    if duration_s <= 0 or spread_deg.size == 0:
+        return spread_deg
+
+    output = spread_deg.astype(np.float32, copy=True)
+    elapsed = 0.0
+    while elapsed < duration_s - 1e-12:
+        step = min(SIMULATION_FRAME_S, duration_s - elapsed)
+        elapsed += step
+        excess = np.maximum(output - np.float32(minimum_deg), 0.0)
+        output -= np.float32(step) * (
+            np.float32(coefficient) * excess**np.float32(exponent)
+            + np.float32(offset)
+        )
+        np.clip(output, minimum_deg, maximum_deg, out=output)
+    return output
+
+
+def update_consecutive_miss_streaks(
+    streaks: np.ndarray,
+    active: np.ndarray,
+    hits: np.ndarray,
+) -> np.ndarray:
+    """
+    Update each engagement independently. A hit resets its streak; a miss adds one.
+    Returns the active engagements that have just reached the pause threshold.
+    """
+    active_hits = active & hits
+    active_misses = active & ~hits
+    streaks[active_hits] = 0
+    streaks[active_misses] += 1
+    return active & (streaks >= CONSECUTIVE_MISSES_BEFORE_PAUSE)
+
+
 # ============================================================
 # Monte Carlo engine
 # ============================================================
@@ -257,6 +326,7 @@ def simulate_weapon(
     distance_m: int,
     trials: int = TRIALS_PER_WEAPON,
     vertical_recoil_control_percent: int = DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT,
+    armor_plates: int = 0,
 ) -> dict[str, Any]:
     weapon = WEAPON_BY_ID[weapon_id]
     trials = int(trials)
@@ -273,44 +343,76 @@ def simulate_weapon(
         1.0 - vertical_recoil_control_percent / 100.0
     )
 
+    armor_plates = int(armor_plates)
+    if armor_plates not in ARMOR_PLATE_OPTIONS:
+        raise ValueError(f"armor_plates must be one of {ARMOR_PLATE_OPTIONS}")
+    initial_armor_hp = np.float32(armor_plates * ARMOR_HP_PER_PLATE)
+
     rng = np.random.default_rng(_seed_for_condition(distance_m))
 
     health = np.full(trials, TARGET_HEALTH, dtype=np.float32)
+    armor_hp = np.full(trials, initial_armor_hp, dtype=np.float32)
     alive = np.ones(trials, dtype=bool)
     recoil_x = np.zeros(trials, dtype=np.float32)
     recoil_y = np.zeros(trials, dtype=np.float32)
+    time_s = np.zeros(trials, dtype=np.float32)
 
     kill_shot = np.zeros(trials, dtype=np.int16)
     kill_time_s = np.full(trials, np.nan, dtype=np.float32)
     hits_before_kill = np.zeros(trials, dtype=np.int16)
+    consecutive_misses = np.zeros(trials, dtype=np.uint8)
+    pause_count = np.zeros(trials, dtype=np.uint16)
 
     rpm = float(weapon["rpm"])
     normal_interval_s = 60.0 / rpm
+    pause_interval_s = max(normal_interval_s, MISS_STREAK_PAUSE_INTERVAL_S)
     magazine_size = max(int(weapon["mag_size"]), 1)
     reload_s = float(weapon["reload_s"])
     rounds_since_reload = 0
-    time_s = 0.0
 
     spread_min = float(weapon["ads_stand_min_deg"])
     spread_max = float(weapon["ads_stand_max_deg"])
-    spread_deg = spread_min
+    spread_deg = np.full(trials, spread_min, dtype=np.float32)
 
     recoil_amount = np.float32(weapon["recoil_amount_deg"])
     recoil_mean = np.float32(weapon["recoil_mean_direction_deg"])
     recoil_variation = float(weapon["recoil_direction_variation_per_side_deg"])
-    body_damage = np.float32(damage_at_distance(weapon["damage_profile"], distance_m))
-    head_damage = np.float32(_ceil_damage(float(body_damage) * HEAD_MULTIPLIER))
+    # Soldier-health damage uses the selected physical distance.
+    health_body_damage = np.float32(
+        damage_at_distance(weapon["damage_profile"], distance_m)
+    )
+    health_head_damage = np.float32(
+        _ceil_damage(float(health_body_damage) * HEAD_MULTIPLIER)
+    )
 
-    low_accuracy_shot_count = 0
-    first_low_accuracy_shot: int | None = None
-    shot_hit_rates: list[float] = []
+    # While any plate HP remains, the armor curve has its drop-off thresholds
+    # extended by 10 m. Automatic-weapon body/chest hits then receive the
+    # Update 1.3.3.0 0.84x damage-vs-armor multiplier. Head hits retain the
+    # model's head multiplier but still use the armor-shifted range curve.
+    armor_base_damage = np.float32(
+        damage_at_distance(
+            weapon["damage_profile"],
+            armor_curve_distance(distance_m),
+        )
+    )
+    armor_body_damage = np.float32(
+        _ceil_damage(
+            float(armor_base_damage)
+            * AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER
+        )
+    )
+    armor_head_damage = np.float32(
+        _ceil_damage(float(armor_base_damage) * HEAD_MULTIPLIER)
+    )
 
     for shot_number in range(1, MAX_SHOTS + 1):
-        # 1) Spread around the current recoil-displaced aim direction.
+        alive_before_shot = alive.copy()
+
+        # 1) Spread around each engagement's current recoil-displaced aim.
         radial_random = rng.random(trials, dtype=np.float32)
         azimuth = rng.random(trials, dtype=np.float32) * np.float32(2.0 * math.pi)
         radial_exponent = np.float32(weapon["spread_radial_distribution_exponent"])
-        radius_deg = np.float32(spread_deg) * radial_random**radial_exponent
+        radius_deg = spread_deg * radial_random**radial_exponent
 
         bullet_angle_x_deg = recoil_x + radius_deg * np.cos(azimuth)
         bullet_angle_y_deg = recoil_y + radius_deg * np.sin(azimuth)
@@ -321,89 +423,149 @@ def simulate_weapon(
         )
 
         hit, head = classify_target(impact_x_m, impact_y_m)
-        shot_hit_rate = float(hit.mean())
-        shot_hit_rates.append(shot_hit_rate)
 
-        # 2) Apply damage only to engagements that are still alive.
-        active_hit = alive & hit
+        # 2) Update each engagement's own consecutive-miss state.
+        pause_trigger = update_consecutive_miss_streaks(
+            consecutive_misses,
+            alive_before_shot,
+            hit,
+        )
+
+        # 3) Apply damage only to engagements that were alive for this shot.
+        # Armor is global extra HP: every hit removes plate HP first, and any
+        # excess from that same bullet carries into soldier health.
+        active_hit = alive_before_shot & hit
         hits_before_kill += active_hit.astype(np.int16)
-        damage = np.where(head, head_damage, body_damage)
-        health -= damage * active_hit
 
-        newly_killed = alive & (health <= DAMAGE_EPSILON)
+        armor_active_hit = active_hit & (armor_hp > DAMAGE_EPSILON)
+        health_only_hit = active_hit & ~armor_active_hit
+
+        armor_damage = np.where(head, armor_head_damage, armor_body_damage).astype(
+            np.float32, copy=False
+        )
+        health_damage = np.where(
+            head, health_head_damage, health_body_damage
+        ).astype(np.float32, copy=False)
+
+        if np.any(armor_active_hit):
+            armor_before = armor_hp[armor_active_hit].copy()
+            incoming = armor_damage[armor_active_hit]
+            absorbed = np.minimum(armor_before, incoming)
+            overflow = np.maximum(incoming - armor_before, 0.0)
+            armor_hp[armor_active_hit] = armor_before - absorbed
+            health[armor_active_hit] -= overflow
+
+        if np.any(health_only_hit):
+            health[health_only_hit] -= health_damage[health_only_hit]
+
+        newly_killed = alive_before_shot & (health <= DAMAGE_EPSILON)
         kill_shot[newly_killed] = shot_number
-        kill_time_s[newly_killed] = time_s
+        kill_time_s[newly_killed] = time_s[newly_killed]
         alive[newly_killed] = False
 
-        # No following-shot state is needed once every trial is dead.
         if not np.any(alive):
             break
 
-        # 3) This shot's recoil affects the next shot.
-        # Sym direction variation is used exactly as mean ± per-side variation.
+        # A kill does not schedule a later pause.
+        pause_trigger &= alive
+
+        # 4) This shot's recoil affects only surviving engagements' next shot.
         recoil_direction_deg = recoil_mean + rng.uniform(
             -recoil_variation,
             recoil_variation,
             size=trials,
         ).astype(np.float32)
         direction_rad = np.deg2rad(recoil_direction_deg)
-        # Player control affects only the vertical component of each new kick.
-        # Horizontal recoil is deliberately left unchanged. For example, 70%
-        # control leaves 30% of the sampled vertical kick in the weapon state.
-        recoil_x += -recoil_amount * np.sin(direction_rad)
-        recoil_y += (
-            recoil_amount * np.cos(direction_rad) * vertical_recoil_remaining
+        recoil_x[alive] += (
+            -recoil_amount * np.sin(direction_rad[alive])
+        )
+        recoil_y[alive] += (
+            recoil_amount
+            * np.cos(direction_rad[alive])
+            * vertical_recoil_remaining
         )
 
-        # 4) Increase spread after firing.
+        # 5) Increase spread after firing for surviving engagements.
         spread_increment = float(weapon["spread_increase_per_shot_deg"])
         if shot_number == 1:
             spread_increment *= float(weapon["spread_first_shot_multiplier"])
-        spread_deg = min(spread_max, spread_deg + spread_increment)
+        spread_deg[alive] = np.minimum(
+            np.float32(spread_max),
+            spread_deg[alive] + np.float32(spread_increment),
+        )
 
-        # 5) Decide the interval before the next shot.
+        # 6) Magazine reload supersedes the short miss-streak pause.
         rounds_since_reload += 1
-        low_accuracy = shot_hit_rate <= LOW_ACCURACY_THRESHOLD
-        if low_accuracy:
-            low_accuracy_shot_count += 1
-            if first_low_accuracy_shot is None:
-                first_low_accuracy_shot = shot_number
-
         if rounds_since_reload >= magazine_size:
-            interval_s = reload_s
+            time_s[alive] += np.float32(reload_s)
             rounds_since_reload = 0
-            recoil_x.fill(0.0)
-            recoil_y.fill(0.0)
-            spread_deg = spread_min
-        else:
-            interval_s = (
-                max(normal_interval_s, LOW_ACCURACY_INTERVAL_S)
-                if low_accuracy
-                else normal_interval_s
-            )
+            recoil_x[alive] = 0.0
+            recoil_y[alive] = 0.0
+            spread_deg[alive] = np.float32(spread_min)
+            consecutive_misses[alive] = 0
+            continue
 
-            recoil_x = recover_recoil_axis(
-                recoil_x,
+        normal_mask = alive & ~pause_trigger
+        pause_mask = alive & pause_trigger
+
+        # The four-miss event causes one actual 0.2 s interval, then the streak resets.
+        pause_count[pause_mask] += 1
+        consecutive_misses[pause_mask] = 0
+
+        # 7) Recoil recovery. Each group has its own interval.
+        if np.any(normal_mask):
+            recoil_x[normal_mask] = recover_recoil_axis(
+                recoil_x[normal_mask],
                 factor=float(weapon["recoil_decay_factor"]),
                 exponent=float(weapon["recoil_decay_exponent"]),
                 time_exponent=float(weapon["recoil_decay_time_exponent"]),
-                duration_s=interval_s,
+                duration_s=normal_interval_s,
                 offset=float(weapon["recoil_decay_offset"]),
             )
-            recoil_y = recover_recoil_axis(
-                recoil_y,
+            recoil_y[normal_mask] = recover_recoil_axis(
+                recoil_y[normal_mask],
                 factor=float(weapon["recoil_decay_factor"]),
                 exponent=float(weapon["recoil_decay_exponent"]),
                 time_exponent=float(weapon["recoil_decay_time_exponent"]),
-                duration_s=interval_s,
+                duration_s=normal_interval_s,
                 offset=float(weapon["recoil_decay_offset"]),
             )
 
-            # The normal shot interval uses firing recovery. Any extra part of the
-            # 0.2 s pause uses not-firing recovery.
-            firing_recovery_s = min(normal_interval_s, interval_s)
-            spread_deg = recover_spread(
-                spread_deg,
+        if np.any(pause_mask):
+            recoil_x[pause_mask] = recover_recoil_axis(
+                recoil_x[pause_mask],
+                factor=float(weapon["recoil_decay_factor"]),
+                exponent=float(weapon["recoil_decay_exponent"]),
+                time_exponent=float(weapon["recoil_decay_time_exponent"]),
+                duration_s=pause_interval_s,
+                offset=float(weapon["recoil_decay_offset"]),
+            )
+            recoil_y[pause_mask] = recover_recoil_axis(
+                recoil_y[pause_mask],
+                factor=float(weapon["recoil_decay_factor"]),
+                exponent=float(weapon["recoil_decay_exponent"]),
+                time_exponent=float(weapon["recoil_decay_time_exponent"]),
+                duration_s=pause_interval_s,
+                offset=float(weapon["recoil_decay_offset"]),
+            )
+
+        # 8) Spread recovery: normal shot interval is firing recovery;
+        #    only the extra part of the 0.2 s pause is non-firing recovery.
+        if np.any(normal_mask):
+            spread_deg[normal_mask] = recover_spread_array(
+                spread_deg[normal_mask],
+                minimum_deg=spread_min,
+                maximum_deg=spread_max,
+                duration_s=normal_interval_s,
+                coefficient=float(weapon["spread_firing_decrease_coefficient"]),
+                exponent=float(weapon["spread_firing_decrease_exponent"]),
+                offset=float(weapon["spread_firing_decrease_offset"]),
+            )
+
+        if np.any(pause_mask):
+            firing_recovery_s = min(normal_interval_s, pause_interval_s)
+            spread_deg[pause_mask] = recover_spread_array(
+                spread_deg[pause_mask],
                 minimum_deg=spread_min,
                 maximum_deg=spread_max,
                 duration_s=firing_recovery_s,
@@ -411,11 +573,10 @@ def simulate_weapon(
                 exponent=float(weapon["spread_firing_decrease_exponent"]),
                 offset=float(weapon["spread_firing_decrease_offset"]),
             )
-
-            non_firing_recovery_s = max(0.0, interval_s - firing_recovery_s)
+            non_firing_recovery_s = max(0.0, pause_interval_s - firing_recovery_s)
             if non_firing_recovery_s > 0:
-                spread_deg = recover_spread(
-                    spread_deg,
+                spread_deg[pause_mask] = recover_spread_array(
+                    spread_deg[pause_mask],
                     minimum_deg=spread_min,
                     maximum_deg=spread_max,
                     duration_s=non_firing_recovery_s,
@@ -424,7 +585,8 @@ def simulate_weapon(
                     offset=float(weapon["spread_not_firing_decrease_offset"]),
                 )
 
-        time_s += interval_s
+        time_s[normal_mask] += np.float32(normal_interval_s)
+        time_s[pause_mask] += np.float32(pause_interval_s)
 
     killed = kill_shot > 0
     killed_count = int(killed.sum())
@@ -438,6 +600,11 @@ def simulate_weapon(
             "distance_m": int(distance_m),
             "trials": trials,
             "vertical_recoil_control_percent": vertical_recoil_control_percent,
+            "armor_plates": armor_plates,
+            "initial_armor_hp": float(initial_armor_hp),
+            "health_body_damage": float(health_body_damage),
+            "armor_body_damage": float(armor_body_damage),
+            "armor_curve_distance_m": float(armor_curve_distance(distance_m)),
             "practical_stk_mean": math.nan,
             "practical_stk_median": math.nan,
             "practical_stk_p80": math.nan,
@@ -446,12 +613,13 @@ def simulate_weapon(
             "ttk_p80_s": math.nan,
             "accuracy": math.nan,
             "kill_probability": 0.0,
-            "first_low_accuracy_shot": first_low_accuracy_shot,
-            "low_accuracy_shot_count": low_accuracy_shot_count,
+            "pause_count_mean": math.nan,
+            "pause_count_median": math.nan,
         }
 
     successful_shots = kill_shot[killed].astype(np.float64)
     successful_times = kill_time_s[killed].astype(np.float64)
+    successful_pauses = pause_count[killed].astype(np.float64)
     total_fired = float(successful_shots.sum())
     total_hits = float(hits_before_kill[killed].sum())
 
@@ -462,6 +630,11 @@ def simulate_weapon(
         "distance_m": int(distance_m),
         "trials": trials,
         "vertical_recoil_control_percent": vertical_recoil_control_percent,
+        "armor_plates": armor_plates,
+        "initial_armor_hp": float(initial_armor_hp),
+        "health_body_damage": float(health_body_damage),
+        "armor_body_damage": float(armor_body_damage),
+        "armor_curve_distance_m": float(armor_curve_distance(distance_m)),
         "practical_stk_mean": float(successful_shots.mean()),
         "practical_stk_median": float(np.median(successful_shots)),
         "practical_stk_p80": float(np.quantile(successful_shots, 0.80)),
@@ -470,8 +643,8 @@ def simulate_weapon(
         "ttk_p80_s": float(np.quantile(successful_times, 0.80)),
         "accuracy": total_hits / total_fired if total_fired else math.nan,
         "kill_probability": kill_probability,
-        "first_low_accuracy_shot": first_low_accuracy_shot,
-        "low_accuracy_shot_count": low_accuracy_shot_count,
+        "pause_count_mean": float(successful_pauses.mean()),
+        "pause_count_median": float(np.median(successful_pauses)),
     }
 
 
@@ -480,6 +653,7 @@ def simulate_all_weapons(
     distance_m: int,
     trials: int = TRIALS_PER_WEAPON,
     vertical_recoil_control_percent: int = DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT,
+    armor_plates: int = 0,
 ) -> pd.DataFrame:
     rows = [
         simulate_weapon(
@@ -487,6 +661,7 @@ def simulate_all_weapons(
             int(distance_m),
             int(trials),
             int(vertical_recoil_control_percent),
+            int(armor_plates),
         )
         for weapon in WEAPON_DATA
     ]
@@ -514,6 +689,8 @@ def _format_results(results: pd.DataFrame) -> pd.DataFrame:
     output["ttk_p80_s"] = output["ttk_p80_s"].round(4)
     output["accuracy"] = (output["accuracy"] * 100.0).round(2)
     output["kill_probability"] = (output["kill_probability"] * 100.0).round(3)
+    output["pause_count_mean"] = output["pause_count_mean"].round(3)
+    output["pause_count_median"] = output["pause_count_median"].round(0).astype("Int64")
 
     return output.rename(
         columns={
@@ -522,6 +699,11 @@ def _format_results(results: pd.DataFrame) -> pd.DataFrame:
             "weapon": "총기",
             "rpm": "RPM",
             "vertical_recoil_control_percent": "수직 반동 제어 (%)",
+            "armor_plates": "방탄판 (장)",
+            "initial_armor_hp": "초기 방탄 HP",
+            "health_body_damage": "일반 몸통 데미지",
+            "armor_body_damage": "방탄 대상 몸통 데미지",
+            "armor_curve_distance_m": "방탄 곡선 조회 거리 (m)",
             "practical_stk_mean": "실전 STK 평균",
             "practical_stk_median": "실전 STK 중앙값",
             "practical_stk_p80": "실전 STK P80",
@@ -530,8 +712,8 @@ def _format_results(results: pd.DataFrame) -> pd.DataFrame:
             "ttk_p80_s": "TTK P80 (초)",
             "accuracy": "명중률 (%)",
             "kill_probability": "처치 성공률 (%)",
-            "first_low_accuracy_shot": "첫 20% 이하 발차",
-            "low_accuracy_shot_count": "20% 이하 발차 수",
+            "pause_count_mean": "평균 4연속 미스 휴식 횟수",
+            "pause_count_median": "중앙값 휴식 횟수",
             "trials": "시행 횟수",
         }
     )
@@ -547,7 +729,7 @@ def render_app() -> None:
         f"BUILD {BUILD_ID} · {MODEL_VERSION} · 총기당 {TRIALS_PER_WEAPON:,}회 고정"
     )
 
-    control_col, distance_col = st.columns([1.0, 2.0])
+    control_col, armor_col, distance_col = st.columns([1.25, 1.0, 2.0])
     with control_col:
         vertical_recoil_control_percent = st.radio(
             "수직 반동 제어",
@@ -560,6 +742,18 @@ def render_app() -> None:
                 "수평 반동과 스프레드는 바뀌지 않습니다."
             ),
         )
+    with armor_col:
+        armor_plates = st.radio(
+            "방탄판",
+            options=list(ARMOR_PLATE_OPTIONS),
+            index=0,
+            horizontal=True,
+            format_func=lambda value: f"{value}장",
+            help=(
+                "1장당 40 HP입니다. 방탄이 남아 있는 동안 데미지 구간은 "
+                "10m 연장되고 자동화기 몸통 데미지는 0.84배가 됩니다."
+            ),
+        )
     with distance_col:
         distance_m = st.slider(
             "거리 (m)", min_value=1, max_value=150, value=30, step=1
@@ -568,20 +762,23 @@ def render_app() -> None:
     st.info(
         "실전 STK는 빗나간 탄까지 포함해 처치까지 실제 발사한 총탄 수입니다. "
         "선택한 수직 반동 제어율은 모든 총기에 동일하게 적용되며 수평 반동에는 적용되지 않습니다. "
-        "한 발차의 고정 코호트 명중률이 20% 이하가 되면 다음 발은 직전 발사 0.2초 후에 나갑니다. "
-        "같은 거리·같은 제어율에서 끝난 총기는 캐시에서 즉시 불러옵니다. "
-        "다른 제어율을 처음 선택하면 해당 조건을 새로 계산합니다."
+        "각 몬테카를로 교전에서 4발 연속으로 빗나가면 다음 발은 직전 발사 0.2초 후에 나갑니다. "
+        "한 발이라도 명중하면 연속 미스 카운터는 0으로 초기화됩니다. "
+        "방탄판은 1장당 40 HP의 전역 추가 체력입니다. 방탄이 남아 있으면 데미지 구간을 "
+        "10m 연장해 조회하고 자동화기 몸통/가슴 데미지에 0.84배를 적용합니다. "
+        "방탄 초과 데미지는 체력으로 넘어가며, 방탄이 소진된 뒤에는 실제 거리의 일반 데미지를 적용합니다. "
+        "같은 거리·같은 제어율·같은 방탄판 조건에서 끝난 총기는 캐시에서 즉시 불러옵니다."
     )
 
     calculate = st.button(
-        f"37종 전체 × {TRIALS_PER_WEAPON:,}회 계산 · 수직 제어 {vertical_recoil_control_percent}%",
+        f"37종 전체 × {TRIALS_PER_WEAPON:,}회 계산 · 수직 제어 {vertical_recoil_control_percent}% · 방탄판 {armor_plates}장",
         type="primary",
         use_container_width=True,
     )
 
     request_key = (
         f"distance-{int(distance_m)}-vertical-control-"
-        f"{int(vertical_recoil_control_percent)}"
+        f"{int(vertical_recoil_control_percent)}-armor-{int(armor_plates)}"
     )
     if calculate:
         st.session_state["bf6_requested_key"] = request_key
@@ -606,6 +803,7 @@ def render_app() -> None:
                 vertical_recoil_control_percent=int(
                     vertical_recoil_control_percent
                 ),
+                armor_plates=int(armor_plates),
             )
         )
         progress.progress(
@@ -629,6 +827,10 @@ def render_app() -> None:
         "총기",
         "RPM",
         "수직 반동 제어 (%)",
+        "방탄판 (장)",
+        "초기 방탄 HP",
+        "일반 몸통 데미지",
+        "방탄 대상 몸통 데미지",
         "실전 STK 평균",
         "실전 STK 중앙값",
         "실전 STK P80",
@@ -637,11 +839,14 @@ def render_app() -> None:
         "TTK P80 (초)",
         "명중률 (%)",
         "처치 성공률 (%)",
-        "첫 20% 이하 발차",
+        "평균 4연속 미스 휴식 횟수",
+        "중앙값 휴식 횟수",
         "시행 횟수",
     ]
 
-    st.subheader(f"{int(distance_m)}m — 자동화기 37종")
+    st.subheader(
+        f"{int(distance_m)}m · 방탄판 {int(armor_plates)}장 — 자동화기 37종"
+    )
     st.dataframe(view[columns], use_container_width=True, hide_index=True)
 
     csv_bytes = view[columns].to_csv(index=False).encode("utf-8-sig")
@@ -651,6 +856,7 @@ def render_app() -> None:
         file_name=(
             f"bf6_mc_{int(distance_m)}m_vcontrol-"
             f"{int(vertical_recoil_control_percent)}pct_"
+            f"armor-{int(armor_plates)}_"
             f"{TRIALS_PER_WEAPON}.csv"
         ),
         mime="text/csv",
@@ -661,6 +867,13 @@ def render_app() -> None:
             {
                 "시행 횟수": f"총기마다 정확히 {TRIALS_PER_WEAPON:,}회",
                 "수직 반동 제어": f"{vertical_recoil_control_percent}%",
+                "방탄판": f"{armor_plates}장 / {armor_plates * ARMOR_HP_PER_PLATE:.0f} HP",
+                "방탄 데미지 구간": (
+                    f"방탄이 남아 있는 동안 모든 구간 경계를 +{ARMOR_DAMAGE_RANGE_EXTENSION_M:.0f}m 연장; "
+                    "계산상 실제 거리-10m의 일반 곡선 조회"
+                ),
+                "방탄 몸통 배율": f"자동화기 {AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER:.2f}x",
+                "방탄 초과 피해": "남은 방탄 HP를 넘는 같은 탄환의 피해는 체력으로 이월",
                 "제어 적용 방식": (
                     "매 발 새로 발생한 수직 반동 성분에만 적용; "
                     "수평 반동·스프레드는 미변경"
@@ -668,24 +881,50 @@ def render_app() -> None:
                 "조준점": f"가슴 중앙 y={AIM_POINT_Y_M}m",
                 "반동 방향": "평균 방향 ± Sym per-side variation",
                 "실전 STK": "빗나간 탄을 포함한 처치 발차",
-                "TTK": "첫 발 0초부터 치명탄 발사 시점까지; 재장전·0.2초 휴식 포함",
+                "TTK": "첫 발 0초부터 치명탄 발사 시점까지; 재장전·4연속 미스 후 0.2초 휴식 포함",
                 "명중률": "성공한 교전에서 처치까지 명중탄 / 발사탄",
-                "20% 규칙": "해당 발차 명중률 ≤20%이면 다음 발까지 총 간격 0.2초",
+                "4연속 미스 규칙": (
+                    "각 교전에서 명중 시 카운터 0; 연속 4회 빗나가면 "
+                    "다음 발까지 총 간격 0.2초 후 카운터 0"
+                ),
                 "탄속/비행시간": "TTK에 미포함",
                 "데미지 모델": MODEL_VERSION,
+                "방탄판 공식 근거": (
+                    "EA REDSEC Armor: 40 HP/plate, 80 HP maximum, +10m drop-off extension; "
+                    "EA Update 1.3.3.0: automatic chest damage vs armor 0.84x"
+                ),
             }
         )
 
 
 def self_test() -> None:
-    # Small smoke tests only; the app itself always uses 262,144 trials.
+    # Deterministic rule test: hit, miss, miss, miss, miss -> pause on final miss.
+    streak = np.zeros(1, dtype=np.uint8)
+    active = np.array([True])
+    sequence = [True, False, False, False, False]
+    triggers = []
+    for event in sequence:
+        trigger = update_consecutive_miss_streaks(
+            streak,
+            active,
+            np.array([event]),
+        )
+        triggers.append(bool(trigger[0]))
+        if trigger[0]:
+            streak[0] = 0
+    if triggers != [False, False, False, False, True]:
+        raise RuntimeError(f"4-miss rule failed: {triggers}")
+
+    # Small Monte Carlo smoke tests only; the app itself always uses 262,144 trials.
     results = [
         simulate_weapon(
             "m433",
             distance_m=20,
             trials=2_048,
             vertical_recoil_control_percent=control,
+            armor_plates=armor_plates,
         )
+        for armor_plates in ARMOR_PLATE_OPTIONS
         for control in VERTICAL_RECOIL_CONTROL_OPTIONS
     ]
     result = results[0]
@@ -694,17 +933,31 @@ def self_test() -> None:
         "ttk_mean_s",
         "accuracy",
         "kill_probability",
+        "pause_count_mean",
     }
     missing = required - set(result)
     if missing:
         raise RuntimeError(f"self-test missing keys: {sorted(missing)}")
     if not (0.0 <= float(result["kill_probability"]) <= 1.0):
         raise RuntimeError("invalid kill probability")
-    for control, control_result in zip(VERTICAL_RECOIL_CONTROL_OPTIONS, results):
-        if int(control_result["vertical_recoil_control_percent"]) != control:
-            raise RuntimeError("vertical recoil control was not preserved")
-        if not (0.0 <= float(control_result["kill_probability"]) <= 1.0):
-            raise RuntimeError("invalid kill probability")
+    for armor_plates in ARMOR_PLATE_OPTIONS:
+        for control in VERTICAL_RECOIL_CONTROL_OPTIONS:
+            index = armor_plates * len(VERTICAL_RECOIL_CONTROL_OPTIONS) + list(
+                VERTICAL_RECOIL_CONTROL_OPTIONS
+            ).index(control)
+            control_result = results[index]
+            if int(control_result["vertical_recoil_control_percent"]) != control:
+                raise RuntimeError("vertical recoil control was not preserved")
+            if int(control_result["armor_plates"]) != armor_plates:
+                raise RuntimeError("armor plate count was not preserved")
+            if not (0.0 <= float(control_result["kill_probability"]) <= 1.0):
+                raise RuntimeError("invalid kill probability")
+
+    m433 = WEAPON_BY_ID["m433"]
+    if damage_at_distance(m433["damage_profile"], 30) != 20.0:
+        raise RuntimeError("ordinary distance damage test failed")
+    if automatic_body_damage_vs_armor(m433["damage_profile"], 30) != 21.0:
+        raise RuntimeError("armor +10m / 0.84x damage test failed")
     print("SELF-TEST OK")
     print(json.dumps(results, ensure_ascii=False, indent=2, default=float))
 
