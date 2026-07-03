@@ -43,7 +43,7 @@ except ImportError:  # allows command-line self-test without Streamlit installed
 # Fixed model settings
 # ============================================================
 
-BUILD_ID = "BF6-MC-262144-BODY-MULTIPLIERS-FIXED-R11"
+BUILD_ID = "BF6-MC-262144-CLEAN-RESULTS-R12"
 MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 hit-zone damage/armor"
 TRIALS_PER_WEAPON = 262_144
 VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80)
@@ -991,17 +991,6 @@ def render_app() -> None:
         "종류",
         "총기",
         "RPM",
-        "수직 반동 제어 (%)",
-        "수평 반동 제어 (%)",
-        "방탄판 (장)",
-        "초기 방탄 HP",
-        "일반 헤드 데미지",
-        "일반 가슴/목 데미지",
-        "일반 복부/팔다리 데미지",
-        "방탄 대상 헤드 데미지",
-        "방탄 대상 가슴/목 데미지",
-        "방탄 대상 복부/팔다리 데미지",
-        "방탄 곡선 조회 거리 (m)",
         "실전 STK 평균",
         "실전 STK 중앙값",
         "실전 STK P80",
