@@ -6,7 +6,9 @@
 # - Pre-1.3.3.0 automatic-primary weapon/recoil/spread data (37 weapons)
 # - Selectable armor: 0, 1, or 2 plates (40 HP each)
 # - Armor damage curve uses +10 m extended drop-off ranges
-# - Update 1.3.3.0 automatic-weapon body/chest damage vs armor: 0.84x
+# - Update 1.3.3.0 automatic-weapon hit-zone multipliers:
+#   head 1.40x, chest/neck 1.00x, stomach/pelvis 0.84x, limbs 0.84x
+# - Against armor, chest/neck is also 0.84x; stomach/pelvis and limbs remain 0.84x
 # - Separate recoil controls: vertical 0/50/70/80%, horizontal 0/20/30%
 # - Search and select only the weapons to calculate; autocomplete shows weapon names only
 # - Monte Carlo trials: exactly 262,144 per selected weapon and selected distance
@@ -41,8 +43,8 @@ except ImportError:  # allows command-line self-test without Streamlit installed
 # Fixed model settings
 # ============================================================
 
-BUILD_ID = "BF6-MC-262144-SEPARATE-VH-CONTROL-R9"
-MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 armor"
+BUILD_ID = "BF6-MC-262144-BODY-MULTIPLIERS-R10"
+MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 hit-zone damage/armor"
 TRIALS_PER_WEAPON = 262_144
 VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80)
 HORIZONTAL_RECOIL_CONTROL_OPTIONS = (0, 20, 30)
@@ -51,11 +53,16 @@ DEFAULT_HORIZONTAL_RECOIL_CONTROL_PERCENT = 0
 BASE_RANDOM_SEED = 20_260_702
 MAX_SHOTS = 240
 TARGET_HEALTH = 100.0
-HEAD_MULTIPLIER = 1.34
+HEAD_MULTIPLIER = 1.40
+CHEST_MULTIPLIER = 1.00
+STOMACH_MULTIPLIER = 0.84
+LIMB_MULTIPLIER = 0.84
 ARMOR_PLATE_OPTIONS = (0, 1, 2)
 ARMOR_HP_PER_PLATE = 40.0
 ARMOR_DAMAGE_RANGE_EXTENSION_M = 10.0
-AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER = 0.84
+AUTOMATIC_CHEST_DAMAGE_VS_ARMOR_MULTIPLIER = 0.84
+AUTOMATIC_STOMACH_DAMAGE_VS_ARMOR_MULTIPLIER = 0.84
+AUTOMATIC_LIMB_DAMAGE_VS_ARMOR_MULTIPLIER = 0.84
 AIM_POINT_Y_M = 1.315
 CONSECUTIVE_MISSES_BEFORE_PAUSE = 4
 MISS_STREAK_PAUSE_INTERVAL_S = 0.20
@@ -115,8 +122,19 @@ def _capsule_mask(
     return (x - nearest_x) ** 2 + (y - nearest_y) ** 2 <= radius**2
 
 
+ZONE_MISS = np.uint8(0)
+ZONE_HEAD = np.uint8(1)
+ZONE_CHEST = np.uint8(2)
+ZONE_STOMACH = np.uint8(3)
+ZONE_LIMBS = np.uint8(4)
+
+
 def classify_target(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (any_hit, head_hit) for the fixed front-facing standing target."""
+    """Return (any_hit, zone_code) for the fixed front-facing standing target.
+
+    Overlap priority is head > chest/neck > stomach/pelvis > limbs. This keeps
+    an arm drawn across the torso from replacing a torso hit with limb damage.
+    """
     head = (
         (x / TARGET.head_half_width_m) ** 2
         + ((y - TARGET.head_center_y_m) / TARGET.head_half_height_m) ** 2
@@ -142,8 +160,13 @@ def classify_target(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarra
         | _capsule_mask(x, y, 0.095, 0.09, 0.13, 0.025, 0.070)
     )
 
-    body = neck | chest | abdomen_pelvis | upper_arms | forearms_hands | legs_feet
-    return head | body, head
+    limbs = upper_arms | forearms_hands | legs_feet
+    zone = np.zeros(x.shape, dtype=np.uint8)
+    zone[limbs] = ZONE_LIMBS
+    zone[abdomen_pelvis] = ZONE_STOMACH
+    zone[neck | chest] = ZONE_CHEST
+    zone[head] = ZONE_HEAD
+    return zone != ZONE_MISS, zone
 
 
 # ============================================================
@@ -177,9 +200,10 @@ def automatic_body_damage_vs_armor(
     profile: list[dict[str, Any]],
     distance_m: float,
 ) -> float:
+    """Compatibility helper: automatic-weapon chest damage while armor remains."""
     shifted_base = damage_at_distance(profile, armor_curve_distance(distance_m))
     return _ceil_damage(
-        shifted_base * AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER
+        shifted_base * AUTOMATIC_CHEST_DAMAGE_VS_ARMOR_MULTIPLIER
     )
 
 
@@ -391,32 +415,74 @@ def simulate_weapon(
     recoil_amount = np.float32(weapon["recoil_amount_deg"])
     recoil_mean = np.float32(weapon["recoil_mean_direction_deg"])
     recoil_variation = float(weapon["recoil_direction_variation_per_side_deg"])
-    # Soldier-health damage uses the selected physical distance.
-    health_body_damage = np.float32(
+    # Update 1.3.3.0 automatic-weapon hit-zone multipliers. Soldier-health
+    # damage uses the selected physical distance.
+    health_base_damage = np.float32(
         damage_at_distance(weapon["damage_profile"], distance_m)
     )
     health_head_damage = np.float32(
-        _ceil_damage(float(health_body_damage) * HEAD_MULTIPLIER)
+        _ceil_damage(float(health_base_damage) * HEAD_MULTIPLIER)
+    )
+    health_chest_damage = np.float32(
+        _ceil_damage(float(health_base_damage) * CHEST_MULTIPLIER)
+    )
+    health_stomach_damage = np.float32(
+        _ceil_damage(float(health_base_damage) * STOMACH_MULTIPLIER)
+    )
+    health_limb_damage = np.float32(
+        _ceil_damage(float(health_base_damage) * LIMB_MULTIPLIER)
     )
 
-    # While any plate HP remains, the armor curve has its drop-off thresholds
-    # extended by 10 m. Automatic-weapon body/chest hits then receive the
-    # Update 1.3.3.0 0.84x damage-vs-armor multiplier. Head hits retain the
-    # model's head multiplier but still use the armor-shifted range curve.
+    # While any plate HP remains, the damage curve thresholds are extended by
+    # 10 m. Chest/neck, stomach/pelvis and limb hits each use 0.84x against
+    # armor. These multipliers are alternatives by zone, not compounded.
     armor_base_damage = np.float32(
         damage_at_distance(
             weapon["damage_profile"],
             armor_curve_distance(distance_m),
         )
     )
-    armor_body_damage = np.float32(
-        _ceil_damage(
-            float(armor_base_damage)
-            * AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER
-        )
-    )
     armor_head_damage = np.float32(
         _ceil_damage(float(armor_base_damage) * HEAD_MULTIPLIER)
+    )
+    armor_chest_damage = np.float32(
+        _ceil_damage(
+            float(armor_base_damage)
+            * AUTOMATIC_CHEST_DAMAGE_VS_ARMOR_MULTIPLIER
+        )
+    )
+    armor_stomach_damage = np.float32(
+        _ceil_damage(
+            float(armor_base_damage)
+            * AUTOMATIC_STOMACH_DAMAGE_VS_ARMOR_MULTIPLIER
+        )
+    )
+    armor_limb_damage = np.float32(
+        _ceil_damage(
+            float(armor_base_damage)
+            * AUTOMATIC_LIMB_DAMAGE_VS_ARMOR_MULTIPLIER
+        )
+    )
+
+    health_damage_by_zone = np.array(
+        [
+            0.0,
+            health_head_damage,
+            health_chest_damage,
+            health_stomach_damage,
+            health_limb_damage,
+        ],
+        dtype=np.float32,
+    )
+    armor_damage_by_zone = np.array(
+        [
+            0.0,
+            armor_head_damage,
+            armor_chest_damage,
+            armor_stomach_damage,
+            armor_limb_damage,
+        ],
+        dtype=np.float32,
     )
 
     for shot_number in range(1, MAX_SHOTS + 1):
@@ -436,7 +502,7 @@ def simulate_weapon(
             np.deg2rad(bullet_angle_y_deg)
         )
 
-        hit, head = classify_target(impact_x_m, impact_y_m)
+        hit, hit_zone = classify_target(impact_x_m, impact_y_m)
 
         # 2) Update each engagement's own consecutive-miss state.
         pause_trigger = update_consecutive_miss_streaks(
@@ -454,12 +520,8 @@ def simulate_weapon(
         armor_active_hit = active_hit & (armor_hp > DAMAGE_EPSILON)
         health_only_hit = active_hit & ~armor_active_hit
 
-        armor_damage = np.where(head, armor_head_damage, armor_body_damage).astype(
-            np.float32, copy=False
-        )
-        health_damage = np.where(
-            head, health_head_damage, health_body_damage
-        ).astype(np.float32, copy=False)
+        armor_damage = armor_damage_by_zone[hit_zone]
+        health_damage = health_damage_by_zone[hit_zone]
 
         if np.any(armor_active_hit):
             armor_before = armor_hp[armor_active_hit].copy()
@@ -619,8 +681,12 @@ def simulate_weapon(
             "horizontal_recoil_control_percent": horizontal_recoil_control_percent,
             "armor_plates": armor_plates,
             "initial_armor_hp": float(initial_armor_hp),
-            "health_body_damage": float(health_body_damage),
-            "armor_body_damage": float(armor_body_damage),
+            "health_head_damage": float(health_head_damage),
+            "health_chest_damage": float(health_chest_damage),
+            "health_lower_damage": float(health_stomach_damage),
+            "armor_head_damage": float(armor_head_damage),
+            "armor_chest_damage": float(armor_chest_damage),
+            "armor_lower_damage": float(armor_stomach_damage),
             "armor_curve_distance_m": float(armor_curve_distance(distance_m)),
             "practical_stk_mean": math.nan,
             "practical_stk_median": math.nan,
@@ -650,8 +716,12 @@ def simulate_weapon(
         "horizontal_recoil_control_percent": horizontal_recoil_control_percent,
         "armor_plates": armor_plates,
         "initial_armor_hp": float(initial_armor_hp),
-        "health_body_damage": float(health_body_damage),
-        "armor_body_damage": float(armor_body_damage),
+        "health_head_damage": float(health_head_damage),
+        "health_chest_damage": float(health_chest_damage),
+        "health_lower_damage": float(health_stomach_damage),
+        "armor_head_damage": float(armor_head_damage),
+        "armor_chest_damage": float(armor_chest_damage),
+        "armor_lower_damage": float(armor_stomach_damage),
         "armor_curve_distance_m": float(armor_curve_distance(distance_m)),
         "practical_stk_mean": float(successful_shots.mean()),
         "practical_stk_median": float(np.median(successful_shots)),
@@ -722,8 +792,12 @@ def _format_results(results: pd.DataFrame) -> pd.DataFrame:
             "horizontal_recoil_control_percent": "수평 반동 제어 (%)",
             "armor_plates": "방탄판 (장)",
             "initial_armor_hp": "초기 방탄 HP",
-            "health_body_damage": "일반 몸통 데미지",
-            "armor_body_damage": "방탄 대상 몸통 데미지",
+            "health_head_damage": "일반 헤드 데미지",
+            "health_chest_damage": "일반 가슴/목 데미지",
+            "health_lower_damage": "일반 복부/팔다리 데미지",
+            "armor_head_damage": "방탄 대상 헤드 데미지",
+            "armor_chest_damage": "방탄 대상 가슴/목 데미지",
+            "armor_lower_damage": "방탄 대상 복부/팔다리 데미지",
             "armor_curve_distance_m": "방탄 곡선 조회 거리 (m)",
             "practical_stk_mean": "실전 STK 평균",
             "practical_stk_median": "실전 STK 중앙값",
@@ -826,7 +900,7 @@ def render_app() -> None:
             format_func=lambda value: f"{value}장",
             help=(
                 "1장당 40 HP입니다. 방탄이 남아 있는 동안 데미지 구간은 "
-                "10m 연장되고 자동화기 몸통 데미지는 0.84배가 됩니다."
+                "10m 연장되고 자동화기 가슴/목 데미지는 0.84배가 됩니다."
             ),
         )
     with distance_col:
@@ -839,7 +913,8 @@ def render_app() -> None:
         "처치까지 실제 발사한 총탄 수입니다. 각 몬테카를로 교전에서 4발 연속으로 "
         "빗나가면 다음 발은 직전 발사 0.2초 후에 나가며, 한 발이라도 명중하면 "
         "연속 미스 카운터가 초기화됩니다. 방탄판은 1장당 40 HP이고, 방탄이 남아 "
-        "있는 동안 +10m 데미지 구간 연장과 자동화기 몸통 0.84배가 적용됩니다."
+        "있는 동안 +10m 데미지 구간 연장과 자동화기 가슴/목 0.84배가 적용됩니다. "
+        "일반 체력에는 헤드 1.40배, 가슴/목 1.00배, 복부/팔다리 0.84배를 적용합니다."
     )
 
     if not selected_weapon_names:
@@ -865,9 +940,9 @@ def render_app() -> None:
         int(armor_plates),
     )
     if calculate:
-        st.session_state["bf6_requested_key_r9"] = request_key
+        st.session_state["bf6_requested_key_r10"] = request_key
 
-    if st.session_state.get("bf6_requested_key_r9") != request_key:
+    if st.session_state.get("bf6_requested_key_r10") != request_key:
         st.warning("총기와 조건을 정한 뒤 계산 버튼을 누르세요.")
         return
 
@@ -977,7 +1052,14 @@ def render_app() -> None:
                     f"방탄이 남아 있는 동안 모든 구간 경계를 +{ARMOR_DAMAGE_RANGE_EXTENSION_M:.0f}m 연장; "
                     "계산상 실제 거리-10m의 일반 곡선 조회"
                 ),
-                "방탄 몸통 배율": f"자동화기 {AUTOMATIC_BODY_DAMAGE_VS_ARMOR_MULTIPLIER:.2f}x",
+                "일반 피격 부위 배율": (
+                    f"헤드 {HEAD_MULTIPLIER:.2f}x · 가슴/목 {CHEST_MULTIPLIER:.2f}x · "
+                    f"복부/팔다리 {STOMACH_MULTIPLIER:.2f}x"
+                ),
+                "방탄 피격 부위 배율": (
+                    f"헤드 {HEAD_MULTIPLIER:.2f}x · 가슴/목 {AUTOMATIC_CHEST_DAMAGE_VS_ARMOR_MULTIPLIER:.2f}x · "
+                    f"복부/팔다리 {AUTOMATIC_STOMACH_DAMAGE_VS_ARMOR_MULTIPLIER:.2f}x"
+                ),
                 "방탄 초과 피해": "남은 방탄 HP를 넘는 같은 탄환의 피해는 체력으로 이월",
                 "제어 적용 방식": (
                     "매 발 새로 발생한 반동을 수직·수평 성분으로 분해해 각각의 "
@@ -1015,6 +1097,19 @@ def self_test() -> None:
             streak[0] = 0
     if triggers != [False, False, False, False, True]:
         raise RuntimeError(f"4-miss rule failed: {triggers}")
+
+    # Deterministic hit-zone classification, including torso-over-arm priority.
+    test_x = np.array([0.0, 0.0, 0.0, 0.095, 0.0], dtype=np.float32)
+    test_y = np.array([1.635, 1.315, 1.00, 0.50, 2.00], dtype=np.float32)
+    test_hit, test_zone = classify_target(test_x, test_y)
+    expected_zone = np.array(
+        [ZONE_HEAD, ZONE_CHEST, ZONE_STOMACH, ZONE_LIMBS, ZONE_MISS],
+        dtype=np.uint8,
+    )
+    if not np.array_equal(test_zone, expected_zone):
+        raise RuntimeError(f"hit-zone classification failed: {test_zone.tolist()}")
+    if not np.array_equal(test_hit, expected_zone != ZONE_MISS):
+        raise RuntimeError("hit mask does not match hit-zone classification")
 
     # Small Monte Carlo smoke tests only; the app itself always uses 262,144 trials.
     results = [
@@ -1065,7 +1160,16 @@ def self_test() -> None:
     if damage_at_distance(m433["damage_profile"], 30) != 20.0:
         raise RuntimeError("ordinary distance damage test failed")
     if automatic_body_damage_vs_armor(m433["damage_profile"], 30) != 21.0:
-        raise RuntimeError("armor +10m / 0.84x damage test failed")
+        raise RuntimeError("armor +10m / chest 0.84x damage test failed")
+    base = damage_at_distance(m433["damage_profile"], 30)
+    if _ceil_damage(base * HEAD_MULTIPLIER) != 28.0:
+        raise RuntimeError("head 1.40x damage test failed")
+    if _ceil_damage(base * CHEST_MULTIPLIER) != 20.0:
+        raise RuntimeError("chest 1.00x damage test failed")
+    if _ceil_damage(base * STOMACH_MULTIPLIER) != 16.8:
+        raise RuntimeError("stomach 0.84x damage test failed")
+    if _ceil_damage(base * LIMB_MULTIPLIER) != 16.8:
+        raise RuntimeError("limb 0.84x damage test failed")
     print("SELF-TEST OK")
     print(json.dumps(results, ensure_ascii=False, indent=2, default=float))
 
