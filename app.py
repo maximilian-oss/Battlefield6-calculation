@@ -10,7 +10,8 @@
 #   head 1.40x, chest/neck 1.00x, stomach/pelvis 0.84x, limbs 0.84x
 # - Against armor, chest/neck is also 0.84x; stomach/pelvis and limbs remain 0.84x
 # - Separate recoil controls: vertical 0/50/70/80%, horizontal 0/20/30%
-# - Search and select only the weapons to calculate; autocomplete shows weapon names only
+# - Search and select only the weapons to calculate; weapon entries show names only
+# - Quick-select pseudo-options: All Assault / All Carbine / All SMG / All LMG
 # - Monte Carlo trials: exactly 262,144 per selected weapon and selected distance
 # - Practical STK includes every missed round fired before the kill
 # - Each Monte Carlo engagement tracks its own consecutive-miss streak
@@ -43,7 +44,7 @@ except ImportError:  # allows command-line self-test without Streamlit installed
 # Fixed model settings
 # ============================================================
 
-BUILD_ID = "BF6-MC-262144-VERTICAL-99-R13"
+BUILD_ID = "BF6-MC-262144-CLASS-QUICK-SELECT-R14"
 MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 hit-zone damage/armor"
 TRIALS_PER_WEAPON = 262_144
 VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80, 99)
@@ -814,6 +815,38 @@ def _format_results(results: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+CLASS_QUICK_SELECT_OPTIONS = (
+    "All Assault",
+    "All Carbine",
+    "All SMG",
+    "All LMG",
+)
+CLASS_QUICK_SELECT_TO_CLASS = {
+    "All Assault": "Assault",
+    "All Carbine": "Carbine",
+    "All SMG": "SMG",
+    "All LMG": "LMG",
+}
+
+
+def _expand_weapon_selection(selected_options: list[str]) -> list[str]:
+    """Expand class quick-select entries to weapon names and remove duplicates.
+
+    The result follows WEAPON_DATA order so tables and cache keys remain stable.
+    """
+    selected_set = set(selected_options)
+    selected_classes = {
+        CLASS_QUICK_SELECT_TO_CLASS[option]
+        for option in selected_options
+        if option in CLASS_QUICK_SELECT_TO_CLASS
+    }
+    return [
+        weapon["weapon"]
+        for weapon in WEAPON_DATA
+        if weapon["weapon"] in selected_set or weapon["class"] in selected_classes
+    ]
+
+
 CLASS_ROW_BACKGROUND = {
     # Muted, semi-transparent backgrounds: category is encoded by the row, not the text.
     "Assault": "rgba(132, 92, 92, 0.24)",
@@ -857,14 +890,16 @@ def render_app() -> None:
 
     weapon_names = sorted(weapon["weapon"] for weapon in WEAPON_DATA)
     weapon_by_name = {weapon["weapon"]: weapon for weapon in WEAPON_DATA}
+    search_options = list(CLASS_QUICK_SELECT_OPTIONS) + weapon_names
 
     st.subheader("총기 검색")
-    selected_weapon_names = st.multiselect(
+    selected_search_options = st.multiselect(
         "계산할 총기",
-        options=weapon_names,
+        options=search_options,
         default=[],
-        placeholder="총기 이름을 입력하세요 (예: M433)",
+        placeholder="총기 이름 또는 All Assault / All Carbine / All SMG / All LMG",
     )
+    selected_weapon_names = _expand_weapon_selection(selected_search_options)
 
     vertical_col, horizontal_col, armor_col, distance_col = st.columns([1.25, 1.15, 1.0, 2.0])
     with vertical_col:
@@ -940,9 +975,9 @@ def render_app() -> None:
         int(armor_plates),
     )
     if calculate:
-        st.session_state["bf6_requested_key_r11"] = request_key
+        st.session_state["bf6_requested_key_r14"] = request_key
 
-    if st.session_state.get("bf6_requested_key_r11") != request_key:
+    if st.session_state.get("bf6_requested_key_r14") != request_key:
         st.warning("총기와 조건을 정한 뒤 계산 버튼을 누르세요.")
         return
 
