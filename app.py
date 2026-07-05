@@ -43,10 +43,10 @@ except ImportError:  # allows command-line self-test without Streamlit installed
 # Fixed model settings
 # ============================================================
 
-BUILD_ID = "BF6-MC-262144-CLEAN-RESULTS-R12"
+BUILD_ID = "BF6-MC-262144-VERTICAL-99-R13"
 MODEL_VERSION = "pre-1.3.3 weapon/recoil/spread + 1.3.3 hit-zone damage/armor"
 TRIALS_PER_WEAPON = 262_144
-VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80)
+VERTICAL_RECOIL_CONTROL_OPTIONS = (0, 50, 70, 80, 99)
 HORIZONTAL_RECOIL_CONTROL_OPTIONS = (0, 20, 30)
 DEFAULT_VERTICAL_RECOIL_CONTROL_PERCENT = 0
 DEFAULT_HORIZONTAL_RECOIL_CONTROL_PERCENT = 0
